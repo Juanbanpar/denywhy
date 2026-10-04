@@ -38,6 +38,25 @@ pub struct DecodedCall {
     pub paths: Vec<PathArgument>,
 }
 
+impl DecodedCall {
+    pub fn follows_final(&self, index: usize) -> bool {
+        match self.operation {
+            Operation::Remove { .. }
+            | Operation::Rename { .. }
+            | Operation::Symlink
+            | Operation::Create
+            | Operation::Mknod { .. } => false,
+            Operation::Link { flags } => index == 0 && flags & libc::AT_SYMLINK_FOLLOW as u32 != 0,
+            Operation::Chown { flags, .. } | Operation::Access { flags, .. } => {
+                flags & libc::AT_SYMLINK_NOFOLLOW as u32 == 0
+            }
+            Operation::Execute { flags } => flags & libc::AT_SYMLINK_NOFOLLOW as u32 == 0,
+            Operation::Open { flags, .. } => flags & libc::O_NOFOLLOW as u64 == 0,
+            _ => true,
+        }
+    }
+}
+
 pub fn decode(
     tid: i32,
     arch: u32,

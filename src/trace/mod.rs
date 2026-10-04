@@ -14,7 +14,9 @@ pub struct Failure {
     pub args: [u64; 6],
     pub errno: i32,
     pub decoded: Option<syscall::DecodedCall>,
-    pub limitation: Option<String>,
+    pub limitations: Vec<String>,
+    pub context: Option<crate::procfs::status::ProcessContext>,
+    pub paths: Vec<crate::fs::path::Walk>,
 }
 
 pub struct Outcome {
@@ -76,7 +78,7 @@ fn executable(command: &OsString) -> PathBuf {
     PathBuf::from(command)
 }
 
-pub fn run(command: &[OsString]) -> io::Result<Outcome> {
+pub fn run(command: &[OsString], redirect_stdout: bool) -> io::Result<Outcome> {
     let executable = CString::new(executable(&command[0]).as_os_str().as_bytes())?;
     let arguments: Vec<CString> = command
         .iter()
@@ -94,6 +96,9 @@ pub fn run(command: &[OsString]) -> io::Result<Outcome> {
         // These buffers remain live in the forked address space through execv.
         unsafe {
             if libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) == -1 {
+                libc::_exit(125);
+            }
+            if redirect_stdout && libc::dup2(libc::STDERR_FILENO, libc::STDOUT_FILENO) < 0 {
                 libc::_exit(125);
             }
             libc::raise(libc::SIGSTOP);
@@ -177,6 +182,32 @@ fn trace(child: i32) -> io::Result<Outcome> {
                                 Ok(call) => (call, None),
                                 Err(e) => (None, Some(e)),
                             };
+                            let mut limitations: Vec<String> = limitation.into_iter().collect();
+                            let context = crate::procfs::status::capture(tid)
+                                .map_err(|e| {
+                                    limitations
+                                        .push(format!("cannot capture /proc/{tid}/status: {e}"))
+                                })
+                                .ok();
+                            let paths = decoded
+                                .as_ref()
+                                .map(|call| {
+                                    call.paths
+                                        .iter()
+                                        .enumerate()
+                                        .filter_map(|(i, p)| {
+                                            p.base.as_ref().ok().map(|base| {
+                                                crate::fs::path::walk(
+                                                    &PathBuf::from(format!("/proc/{tid}/root")),
+                                                    base,
+                                                    &p.path,
+                                                    call.follows_final(i),
+                                                )
+                                            })
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
                             failures.push(Failure {
                                 tid,
                                 number,
@@ -184,7 +215,9 @@ fn trace(child: i32) -> io::Result<Outcome> {
                                 args,
                                 errno: errno as i32,
                                 decoded,
-                                limitation,
+                                limitations,
+                                context,
+                                paths,
                             });
                         }
                     }
