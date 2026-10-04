@@ -34,47 +34,22 @@ fn main() {
             for event in &mut outcome.failures {
                 analyze::add_seccomp_observation(event);
             }
-            if cli.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&output::json_report(&cli, &outcome)).unwrap()
-                );
+            let groups = output::groups(&outcome.failures);
+            let result = if cli.json {
+                use std::io::Write;
+                let mut out = std::io::stdout().lock();
+                serde_json::to_writer_pretty(
+                    &mut out,
+                    &output::json::report(&cli, &outcome, &groups),
+                )
+                .map_err(std::io::Error::other)
+                .and_then(|_| writeln!(out))
             } else {
-                eprintln!("Command exited with status {}.", outcome.code);
-                for event in outcome
-                    .failures
-                    .iter()
-                    .take(if cli.all { usize::MAX } else { 10 })
-                {
-                    eprintln!(
-                        "DENIED tid={} syscall={} -> {}",
-                        event.tid,
-                        event
-                            .decoded
-                            .as_ref()
-                            .map(|c| c.name)
-                            .unwrap_or("unsupported"),
-                        output::errno(event.errno)
-                    );
-                    for cause in &event.causes {
-                        eprintln!("Cause: {} ({:?})", cause.summary, cause.confidence);
-                    }
-                    if let Some(call) = &event.decoded {
-                        eprintln!("operation: {:?}", call.operation);
-                        for path in &call.paths {
-                            eprintln!(
-                                "dirfd={} path={:?} base={:?}",
-                                path.dirfd, path.path, path.base
-                            );
-                        }
-                    }
-                    if cli.verbose {
-                        eprintln!("{:?}", event.context);
-                    }
-                    for limitation in &event.limitations {
-                        eprintln!("{limitation}");
-                    }
-                }
+                output::human::render(&cli, &outcome, &groups, &mut std::io::stderr().lock())
+            };
+            if let Err(error) = result {
+                eprintln!("denywhy: cannot write diagnostic output: {error}");
+                std::process::exit(125);
             }
             std::process::exit(outcome.code);
         }

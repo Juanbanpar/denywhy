@@ -8,7 +8,8 @@ pub const NATIVE_ARCH: u32 = 0xc000003e;
 #[cfg(target_arch = "aarch64")]
 pub const NATIVE_ARCH: u32 = 0xc00000b7;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Operation {
     Open { flags: u64, resolve: u64 },
     Access { mode: u32, flags: u32 },
@@ -36,6 +37,41 @@ pub struct DecodedCall {
     pub name: &'static str,
     pub operation: Operation,
     pub paths: Vec<PathArgument>,
+}
+
+impl Operation {
+    pub fn name(&self) -> &'static str {
+        match *self {
+            Self::Open { flags, .. } => match flags as i32 & libc::O_ACCMODE {
+                libc::O_WRONLY => "write",
+                libc::O_RDWR => "read_write",
+                _ => {
+                    if flags & libc::O_PATH as u64 != 0 {
+                        "path_lookup"
+                    } else {
+                        "read"
+                    }
+                }
+            },
+            Self::Access { mode, .. } => match mode & 7 {
+                0 => "existence",
+                4 => "read",
+                2 => "write",
+                1 => "execute",
+                _ => "access",
+            },
+            Self::Execute { .. } => "execute",
+            Self::Create => "create",
+            Self::Remove { .. } => "remove",
+            Self::Rename { .. } => "rename",
+            Self::Link { .. } => "link",
+            Self::Symlink => "symlink",
+            Self::Chmod { .. } => "chmod",
+            Self::Chown { .. } => "chown",
+            Self::Truncate => "truncate",
+            Self::Mknod { .. } => "mknod",
+        }
+    }
 }
 
 impl DecodedCall {
