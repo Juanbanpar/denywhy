@@ -31,6 +31,9 @@ fn main() {
     match trace::run(&cli.command, cli.json) {
         Ok(mut outcome) => {
             audit::correlate_after_exit(&mut outcome.failures);
+            for event in &mut outcome.failures {
+                analyze::add_seccomp_observation(event);
+            }
             if cli.json {
                 println!(
                     "{}",

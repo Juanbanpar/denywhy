@@ -255,3 +255,68 @@ fn modifying(operation: &Operation, index: usize) -> bool {
         _ => true,
     }
 }
+
+pub fn add_seccomp_observation(event: &mut Failure) {
+    if event
+        .causes
+        .iter()
+        .any(|c| c.confidence != Confidence::Possible)
+    {
+        return;
+    }
+    if let Some(context) = &event.context
+        && context.seccomp != 0
+    {
+        event.causes.push(Cause { kind: CauseKind::Seccomp, confidence: Confidence::Possible,
+            summary: "seccomp is active, but no direct evidence ties it to this denial".into(),
+            evidence: json!({"mode": context.seccomp, "filters": context.seccomp_filters, "no_new_privs": context.no_new_privs}) });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trace::syscall::{DecodedCall, PathArgument};
+    use std::path::PathBuf;
+    #[test]
+    fn active_seccomp_does_not_become_a_proven_cause() {
+        let context = crate::procfs::status::parse("Tgid: 42\nUid: 1000 1000 1000 1000\nGid: 1000 1000 1000 1000\nGroups: 1000\nCapInh: 0\nCapPrm: 0\nCapEff: 0\nCapBnd: 0\nCapAmb: 0\nNoNewPrivs: 1\nSeccomp: 2\nSeccomp_filters: 2\n").unwrap();
+        let mut event = Failure {
+            tid: 42,
+            number: libc::SYS_openat as u64,
+            arch: crate::trace::syscall::NATIVE_ARCH,
+            args: [0; 6],
+            errno: libc::EACCES,
+            decoded: Some(DecodedCall {
+                name: "openat",
+                operation: Operation::Open {
+                    flags: 0,
+                    resolve: 0,
+                },
+                paths: vec![PathArgument {
+                    dirfd: libc::AT_FDCWD,
+                    path: PathBuf::from("/allowed"),
+                    base: Ok(PathBuf::from("/")),
+                }],
+            }),
+            limitations: vec![],
+            context: Some(context),
+            paths: vec![],
+            causes: vec![],
+            mounts: vec![],
+            timestamp: std::time::SystemTime::now(),
+        };
+        add_seccomp_observation(&mut event);
+        assert_eq!(event.causes.len(), 1);
+        assert_eq!(event.causes[0].kind, CauseKind::Seccomp);
+        assert_eq!(event.causes[0].confidence, Confidence::Possible);
+        event.causes = vec![Cause {
+            kind: CauseKind::Dac,
+            confidence: Confidence::Strong,
+            summary: "search denied".into(),
+            evidence: json!({}),
+        }];
+        add_seccomp_observation(&mut event);
+        assert_eq!(event.causes.len(), 1);
+    }
+}
