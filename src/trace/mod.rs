@@ -93,7 +93,6 @@ struct PendingSyscall {
     number: u64,
     args: [u64; 6],
     decoded: Result<Option<syscall::DecodedCall>, String>,
-    timestamp: SystemTime,
     context: Option<crate::procfs::status::ProcessContext>,
 }
 #[derive(Default)]
@@ -295,7 +294,6 @@ fn syscall_stop(tid: i32, tracee: &mut Tracee, failures: &mut Vec<Failure>) -> i
                 number: info.data[0],
                 args,
                 decoded,
-                timestamp: SystemTime::now(),
                 context,
             });
         }
@@ -369,6 +367,6 @@ fn capture_failure(tid: i32, pending: PendingSyscall, errno: i32) -> Failure {
         paths,
         causes: Vec::new(),
         mounts: Vec::new(),
-        timestamp: pending.timestamp,
+        timestamp: SystemTime::now(),
     }
 }

@@ -6,6 +6,7 @@
 compile_error!("denywhy supports native Linux x86_64 and aarch64 only");
 
 mod analyze;
+mod audit;
 mod cli;
 mod fs;
 mod model;
@@ -28,7 +29,8 @@ fn main() {
         }
     };
     match trace::run(&cli.command, cli.json) {
-        Ok(outcome) => {
+        Ok(mut outcome) => {
+            audit::correlate_after_exit(&mut outcome.failures);
             if cli.json {
                 println!(
                     "{}",
