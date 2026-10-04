@@ -197,9 +197,14 @@ mount namespaces are available.
 
 Restricted hosts explicitly skip live tracing tests. Set
 `DENYWHY_REQUIRE_PTRACE=1` to make unavailable child tracing a test failure;
-CI does so on native x86_64 and aarch64 Ubuntu runners. These configurations do
-not establish validation on Debian, Fedora, or real enforcing SELinux/AppArmor
-systems. Release acceptance needs live validation on those environments too.
+CI does so on native x86_64 and aarch64 Ubuntu runners.
+
+The live x86_64 suite was validated in Fedora 44 toolbox, including private
+noexec/read-only mounts, seccomp errno injection, descendant/thread exec and
+signal cleanup. Its integration suite passed 100 consecutive runs after fixing
+a late fork-event bookkeeping race. Ubuntu, Debian, native aarch64 and real
+enforcing SELinux/AppArmor systems still need live validation; configuring CI
+does not establish that those checks have run.
 
 ## License
 
