@@ -254,7 +254,31 @@ fn apply_mounts(event: &mut Failure, mounts: &[crate::procfs::mountinfo::Mount])
         if walk.limitation.is_some() {
             continue;
         }
-        match crate::procfs::mountinfo::containing(mounts, &walk.target) {
+        // Entry mutations acquire write access on the parent mount. A bind
+        // mount on the final inode must not be blamed for its parent directory.
+        let parent_mount = matches!(
+            call.operation,
+            Operation::Remove { .. }
+                | Operation::Rename { .. }
+                | Operation::Create
+                | Operation::Mknod { .. }
+                | Operation::Symlink
+        ) || matches!(call.operation, Operation::Link { .. }) && index == 1
+            || matches!(call.operation, Operation::Open { .. }) && walk.missing;
+        let mount_path = if parent_mount {
+            if walk.missing {
+                walk.components.last()
+            } else {
+                walk.components.iter().rev().nth(1)
+            }
+            .map(|c| c.path.as_path())
+        } else {
+            Some(walk.target.as_path())
+        };
+        let Some(mount_path) = mount_path else {
+            continue;
+        };
+        match crate::procfs::mountinfo::containing(mounts, mount_path) {
             Ok(Some(mount)) => {
                 let mut evidence = json!({"path": crate::output::bytes(walk.target.as_os_str()), "mount_id": mount.id, "mountpoint": crate::output::bytes(mount.point.as_os_str()), "root": crate::output::bytes(mount.root.as_os_str()), "read_only": mount.read_only, "noexec": mount.noexec, "nosuid": mount.nosuid, "nodev": mount.nodev});
                 if !matches!(call.operation, Operation::Execute { .. }) {
@@ -274,7 +298,7 @@ fn apply_mounts(event: &mut Failure, mounts: &[crate::procfs::mountinfo::Mount])
                         evidence,
                     });
                 } else if event.errno == libc::EROFS
-                    && modifying(&call.operation, index)
+                    && modifying(&call.operation, index, walk.missing)
                     && mount.read_only
                 {
                     event.causes.push(Cause {
@@ -292,11 +316,13 @@ fn apply_mounts(event: &mut Failure, mounts: &[crate::procfs::mountinfo::Mount])
         }
     }
 }
-fn modifying(operation: &Operation, index: usize) -> bool {
+fn modifying(operation: &Operation, index: usize, missing: bool) -> bool {
     match *operation {
         Operation::Open { flags, .. } => {
             flags & libc::O_PATH as u64 == 0
-                && flags & (libc::O_ACCMODE | libc::O_CREAT | libc::O_TRUNC) as u64 != 0
+                && (flags & (libc::O_ACCMODE | libc::O_TRUNC) as u64 != 0
+                    || missing && flags & libc::O_CREAT as u64 != 0
+                    || flags & libc::O_TMPFILE as u64 == libc::O_TMPFILE as u64)
         }
         Operation::Access { mode, .. } => mode & libc::W_OK as u32 != 0,
         Operation::Execute { .. } => false,
@@ -385,6 +411,29 @@ mod tests {
             resolve: 0,
         };
         event.causes.clear();
+        apply_mounts(&mut event, &mounts);
+        assert!(event.causes.is_empty());
+        event.decoded.as_mut().unwrap().operation = Operation::Open {
+            flags: libc::O_CREAT as u64,
+            resolve: 0,
+        };
+        apply_mounts(&mut event, &mounts);
+        assert!(event.causes.is_empty());
+        // Unlink changes the directory entry, not the final inode's mount.
+        let metadata = std::fs::metadata(temporary.path()).unwrap();
+        event.paths[0].components.insert(
+            0,
+            crate::fs::path::ComponentState {
+                path: PathBuf::from("/"),
+                inspection_path: temporary.path().into(),
+                metadata,
+            },
+        );
+        event.decoded.as_mut().unwrap().operation = Operation::Remove { directory: false };
+        let mounts = crate::procfs::mountinfo::parse(
+            b"1 0 0:1 / / rw - tmpfs x rw\n2 1 0:2 / /program ro - tmpfs x ro\n",
+        )
+        .unwrap();
         apply_mounts(&mut event, &mounts);
         assert!(event.causes.is_empty());
     }
