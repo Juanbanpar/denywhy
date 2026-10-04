@@ -40,6 +40,9 @@ pub struct DecodedCall {
 }
 
 impl Operation {
+    pub fn accepts_empty_path(&self) -> bool {
+        matches!(*self, Self::Execute { flags } | Self::Access { flags, .. } | Self::Chown { flags, .. } | Self::Link { flags } if flags & libc::AT_EMPTY_PATH as u32 != 0)
+    }
     pub fn name(&self) -> &'static str {
         match *self {
             Self::Open { flags, .. } => match flags as i32 & libc::O_ACCMODE {

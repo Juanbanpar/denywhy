@@ -43,7 +43,7 @@ pub fn groups(failures: &[Failure]) -> Vec<Group<'_>> {
                 _ => json!({"path": bytes(path.path.as_os_str()), "base": path.base.as_ref().ok().map(|p| bytes(p.as_os_str()))}),
             }
         }).collect()).unwrap_or_default();
-        let key = json!({"syscall": event.number, "arch": event.arch, "errno": event.errno, "operation": event.decoded.as_ref().map(|c| &c.operation), "paths": paths, "causes": causes,
+        let key = json!({"syscall": event.number, "arch": event.arch, "errno": event.errno, "operation": event.decoded.as_ref().map(|c| &c.operation), "paths": paths, "causes": causes, "security_context": event.context.as_ref().map(|c| json!({"credentials": c.credentials, "capabilities": c.capabilities, "seccomp": c.seccomp, "filters": c.seccomp_filters, "no_new_privs": c.no_new_privs, "user_namespace_differs": c.user_namespace_differs, "apparmor": c.apparmor, "selinux": c.selinux})),
             "unsupported_arguments": if event.decoded.is_none() { Some(event.args) } else { None }}).to_string();
         let pid = event.context.as_ref().map_or(event.tid as u32, |c| c.tgid);
         if let Some(index) = keys.get(&key).copied() {

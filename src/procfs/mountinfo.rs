@@ -74,20 +74,17 @@ pub fn parse(bytes: &[u8]) -> Result<Vec<Mount>, String> {
 }
 
 pub fn containing<'a>(mounts: &'a [Mount], path: &Path) -> Result<Option<&'a Mount>, String> {
-    let candidates: Vec<_> = mounts
+    let Some(depth) = mounts
         .iter()
         .filter(|m| path.starts_with(&m.point))
-        .collect();
-    let Some(depth) = candidates
-        .iter()
         .map(|m| m.point.components().count())
         .max()
     else {
         return Ok(None);
     };
-    let mut matches = candidates
-        .into_iter()
-        .filter(|m| m.point.components().count() == depth);
+    let mut matches = mounts
+        .iter()
+        .filter(|m| path.starts_with(&m.point) && m.point.components().count() == depth);
     let first = matches.next();
     if matches.next().is_some() {
         return Err("stacked mountpoints cannot be distinguished by pathname".into());

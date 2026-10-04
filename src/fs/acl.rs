@@ -3,13 +3,13 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
 pub struct Entry {
     pub tag: u16,
     pub permissions: u16,
     pub id: u32,
 }
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct Acl {
     entries: Vec<Entry>,
 }

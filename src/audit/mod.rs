@@ -73,7 +73,8 @@ fn journal(since: SystemTime, until: SystemTime) -> Result<Vec<u8>, String> {
         .stdout(file.try_clone().map_err(|e| e.to_string())?)
         .spawn()
         .map_err(|e| format!("journalctl: {e}"))?;
-    // pidfd + poll gives this external query a bounded deadline without sleeps.
+    // pidfd_open takes only scalar arguments; the PID belongs to this child.
+    // poll gives the external query a bounded deadline without sleeps.
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) };
     if fd < 0 {
         let _ = child.kill();

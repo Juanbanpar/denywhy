@@ -5,25 +5,36 @@ use serde_json::json;
 use std::os::unix::fs::MetadataExt;
 
 pub fn analyze_denial(event: &mut Failure) {
-    if let Some(call) = &event.decoded && (call.paths.iter().any(|p| p.path.as_os_str().is_empty() && !matches!(call.operation, Operation::Execute { flags } | Operation::Access { flags, .. } | Operation::Chown { flags, .. } | Operation::Link { flags } if flags & libc::AT_EMPTY_PATH as u32 != 0)) || matches!(call.operation, Operation::Access { mode, .. } if mode & !7 != 0)) {
-        event.limitations.push("invalid pathname or access mode has no DAC/mount interpretation".into()); return;
-    }
-    if event.decoded.as_ref().is_some_and(
-        |call| matches!(call.operation, Operation::Open { resolve, .. } if resolve != 0),
-    ) {
-        event.limitations.push(
-            "openat2 resolution constraints are present; ordinary path resolution may differ."
-                .into(),
-        );
-        return;
+    if let Some(call) = &event.decoded {
+        let empty_path = call.paths.iter().any(|p| p.path.as_os_str().is_empty());
+        let oversized_path = call
+            .paths
+            .iter()
+            .any(|p| p.path.as_os_str().as_encoded_bytes().len() >= libc::PATH_MAX as usize);
+        let invalid_mode =
+            matches!(call.operation, Operation::Access { mode, .. } if mode & !7 != 0);
+        if (empty_path && !call.operation.accepts_empty_path()) || invalid_mode || oversized_path {
+            event.limitations.push(
+                "invalid or oversized pathname/access mode has no DAC/mount interpretation".into(),
+            );
+            return;
+        }
+        if matches!(call.operation, Operation::Open { resolve, .. } if resolve != 0) {
+            event.limitations.push(
+                "openat2 resolution constraints are present; ordinary path resolution may differ."
+                    .into(),
+            );
+            return;
+        }
     }
     analyze_mounts(event);
     let (Some(call), Some(context)) = (&event.decoded, &event.context) else {
         return;
     };
-    let mut credentials = context.credentials.clone();
-    let mut capabilities = context.capabilities.effective;
-    if let Operation::Access { flags, .. } = call.operation {
+    let mut access_credentials;
+    let (credentials, capabilities) = if let Operation::Access { flags, .. } = call.operation {
+        access_credentials = context.credentials.clone();
+        let credentials = &mut access_credentials;
         let effective = flags & libc::AT_EACCESS as u32 != 0;
         credentials.fsuid = if effective {
             credentials.euid
@@ -35,14 +46,17 @@ pub fn analyze_denial(event: &mut Failure) {
         } else {
             credentials.rgid
         };
-        capabilities = if effective {
-            capabilities
+        let capabilities = if effective {
+            context.capabilities.effective
         } else if credentials.ruid == 0 {
             context.capabilities.permitted
         } else {
             0
         };
-    }
+        (&access_credentials, capabilities)
+    } else {
+        (&context.credentials, context.capabilities.effective)
+    };
     let confidence = if context.user_namespace_differs == Some(false) {
         Confidence::Strong
     } else {
@@ -85,12 +99,12 @@ pub fn analyze_denial(event: &mut Failure) {
             let inode = inode(&component.metadata);
             match acl::read(&component.inspection_path) {
                 Ok(acl) => {
-                    if !dac::allowed(&inode, &credentials, capabilities, acl.as_ref(), requested)
+                    if !dac::allowed(&inode, credentials, capabilities, acl.as_ref(), requested)
                         && event.errno == libc::EACCES
                     {
                         event.causes.push(Cause { kind: if acl.is_some() { CauseKind::PosixAcl } else { CauseKind::Dac }, confidence,
                             summary: if !final_object { "missing directory search permission".into() } else { format!("missing {} permission", permission_name(requested)) },
-                            evidence: json!({"path": crate::output::bytes(component.path.as_os_str()), "uid": inode.uid, "gid": inode.gid, "mode": inode.mode, "requested": requested, "fsuid": credentials.fsuid, "fsgid": credentials.fsgid, "acl_present": acl.is_some()}) });
+                            evidence: json!({"path": crate::output::bytes(component.path.as_os_str()), "uid": inode.uid, "gid": inode.gid, "mode": inode.mode, "requested": requested, "fsuid": credentials.fsuid, "fsgid": credentials.fsgid, "acl": acl}) });
                         break;
                     }
                 }
@@ -118,9 +132,9 @@ pub fn analyze_denial(event: &mut Failure) {
         {
             let parent_inode = inode(&parent.metadata);
             match acl::read(&parent.inspection_path) {
-                Ok(acl) if !dac::allowed(&parent_inode, &credentials, capabilities, acl.as_ref(), 3) => event.causes.push(Cause {
+                Ok(acl) if !dac::allowed(&parent_inode, credentials, capabilities, acl.as_ref(), 3) => event.causes.push(Cause {
                     kind: if acl.is_some() { CauseKind::PosixAcl } else { CauseKind::Dac }, confidence,
-                    summary: "missing parent directory write/search permission".into(), evidence: json!({"path": crate::output::bytes(parent.path.as_os_str()), "uid": parent_inode.uid, "gid": parent_inode.gid, "mode": parent_inode.mode, "requested": 3, "acl_present": acl.is_some()}) }),
+                    summary: "missing parent directory write/search permission".into(), evidence: json!({"path": crate::output::bytes(parent.path.as_os_str()), "uid": parent_inode.uid, "gid": parent_inode.gid, "mode": parent_inode.mode, "requested": 3, "acl": acl}) }),
                 Err(e) => event.limitations.push(format!("ACL state unavailable for {:?}: {e}", parent.path)), _ => {},
             }
         }
@@ -143,7 +157,7 @@ pub fn analyze_denial(event: &mut Failure) {
             if dac::ownership_denied(
                 &call.operation,
                 &inode(&target.metadata),
-                &credentials,
+                credentials,
                 capabilities,
             ) {
                 event.causes.push(Cause { kind: CauseKind::Capability, confidence, summary: "ownership or capability requirement is not satisfied".into(), evidence: json!({"path": crate::output::bytes(target.path.as_os_str()), "owner": target.metadata.uid(), "fsuid": credentials.fsuid, "effective_capabilities": capabilities}) });
@@ -215,9 +229,9 @@ fn permission_name(bits: u16) -> &'static str {
 }
 
 fn analyze_mounts(event: &mut Failure) {
-    let Some(call) = &event.decoded else {
+    if event.decoded.is_none() {
         return;
-    };
+    }
     let mounts = std::fs::read(format!("/proc/{}/mountinfo", event.tid))
         .map_err(|e| e.to_string())
         .and_then(|b| crate::procfs::mountinfo::parse(&b));
@@ -230,11 +244,17 @@ fn analyze_mounts(event: &mut Failure) {
             return;
         }
     };
+    apply_mounts(event, &mounts);
+}
+fn apply_mounts(event: &mut Failure, mounts: &[crate::procfs::mountinfo::Mount]) {
+    let Some(call) = &event.decoded else {
+        return;
+    };
     for (index, walk) in event.paths.iter().enumerate() {
         if walk.limitation.is_some() {
             continue;
         }
-        match crate::procfs::mountinfo::containing(&mounts, &walk.target) {
+        match crate::procfs::mountinfo::containing(mounts, &walk.target) {
             Ok(Some(mount)) => {
                 let mut evidence = json!({"path": crate::output::bytes(walk.target.as_os_str()), "mount_id": mount.id, "mountpoint": crate::output::bytes(mount.point.as_os_str()), "root": crate::output::bytes(mount.root.as_os_str()), "read_only": mount.read_only, "noexec": mount.noexec, "nosuid": mount.nosuid, "nodev": mount.nodev});
                 if !matches!(call.operation, Operation::Execute { .. }) {
@@ -307,6 +327,67 @@ mod tests {
     use super::*;
     use crate::trace::syscall::{DecodedCall, PathArgument};
     use std::path::PathBuf;
+    #[test]
+    fn mount_evidence_is_proven_only_for_relevant_failures() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("program");
+        std::fs::write(&path, b"binary").unwrap();
+        let logical = PathBuf::from("/program");
+        let mounts =
+            crate::procfs::mountinfo::parse(b"1 0 0:1 / / ro,noexec,nosuid - tmpfs x ro\n")
+                .unwrap();
+        let mut event = Failure {
+            tid: std::process::id() as i32,
+            number: libc::SYS_execve as u64,
+            arch: crate::trace::syscall::NATIVE_ARCH,
+            args: [0; 6],
+            errno: libc::EACCES,
+            decoded: Some(DecodedCall {
+                name: "execve",
+                operation: Operation::Execute { flags: 0 },
+                paths: vec![PathArgument {
+                    dirfd: libc::AT_FDCWD,
+                    path: logical.clone(),
+                    base: Ok(PathBuf::from("/")),
+                }],
+            }),
+            context: None,
+            limitations: vec![],
+            paths: vec![crate::fs::path::Walk {
+                components: vec![crate::fs::path::ComponentState {
+                    path: logical.clone(),
+                    inspection_path: path.clone(),
+                    metadata: std::fs::metadata(path).unwrap(),
+                }],
+                target: logical,
+                missing: false,
+                limitation: None,
+            }],
+            causes: vec![],
+            mounts: vec![],
+            timestamp: std::time::SystemTime::now(),
+        };
+        apply_mounts(&mut event, &mounts);
+        assert_eq!(event.causes[0].kind, CauseKind::NoExecMount);
+        assert_eq!(event.causes[0].confidence, Confidence::Proven);
+        event.errno = libc::EROFS;
+        event.decoded.as_mut().unwrap().operation = Operation::Open {
+            flags: libc::O_WRONLY as u64,
+            resolve: 0,
+        };
+        event.causes.clear();
+        event.mounts.clear();
+        apply_mounts(&mut event, &mounts);
+        assert_eq!(event.causes[0].kind, CauseKind::ReadOnlyMount);
+        assert!(event.mounts[0].get("nosuid").is_none());
+        event.decoded.as_mut().unwrap().operation = Operation::Open {
+            flags: (libc::O_PATH | libc::O_CREAT) as u64,
+            resolve: 0,
+        };
+        event.causes.clear();
+        apply_mounts(&mut event, &mounts);
+        assert!(event.causes.is_empty());
+    }
     #[test]
     fn creation_only_checks_parent_write_for_new_objects() {
         assert!(requires_parent_write(&Operation::Create, 0, true));

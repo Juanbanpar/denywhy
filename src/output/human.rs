@@ -112,6 +112,35 @@ pub fn render(
             if let Some(directory) = cause.evidence.get("directory") {
                 writeln!(out, "    directory: {}", display_value(directory))?;
             }
+            if let Some(entries) = cause
+                .evidence
+                .get("acl")
+                .and_then(|a| a.get("entries"))
+                .and_then(|a| a.as_array())
+            {
+                for entry in entries {
+                    let tag = entry["tag"].as_u64().unwrap_or(0);
+                    let label = match tag {
+                        1 => "owner",
+                        2 => "user",
+                        4 => "owning group",
+                        8 => "group",
+                        16 => "mask",
+                        32 => "other",
+                        _ => "unknown",
+                    };
+                    let qualifier = if tag == 2 || tag == 8 {
+                        format!(" {}", entry["id"])
+                    } else {
+                        String::new()
+                    };
+                    writeln!(
+                        out,
+                        "    ACL {label}{qualifier}: {:03o}",
+                        entry["permissions"].as_u64().unwrap_or(0)
+                    )?;
+                }
+            }
             if let Some(evidence) = cause.evidence.get("fields") {
                 writeln!(out, "    audit fields: {evidence}")?;
             }
