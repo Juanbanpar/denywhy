@@ -173,6 +173,48 @@ fn captures_filesystem_syscalls_and_relative_paths() {
     .unwrap();
 }
 #[test]
+fn retains_denied_path_search_during_command_lookup() {
+    if !available() {
+        return;
+    }
+    // Mode-based search denial needs an unprivileged user.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let dir = fixture();
+    let result = output(
+        Command::new(env!("CARGO_BIN_EXE_denywhy"))
+            .args(["--json", "--", "file"])
+            .env("PATH", dir.path().join("blocked")),
+    );
+    fs::set_permissions(
+        dir.path().join("blocked"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    assert_eq!(
+        result.status.code(),
+        Some(126),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert!(
+        report["denials"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["syscall"] == "execve"
+                && d["errno"] == "EACCES"
+                && d["paths"][0]["path"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("blocked/file")),
+        "{report}"
+    );
+}
+
+#[test]
 fn seccomp_errno_does_not_become_dac() {
     if !available() {
         return;

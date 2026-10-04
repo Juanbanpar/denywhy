@@ -46,10 +46,15 @@ fn executable(command: &OsString) -> PathBuf {
         };
         // This checks PATH candidates using the invoking user's access state;
         // the chosen executable is separately inspected before the child runs.
-        if unsafe { libc::access(name.as_ptr(), libc::X_OK) } == 0 && candidate.is_file() {
+        let accessible = unsafe { libc::access(name.as_ptr(), libc::X_OK) } == 0;
+        let denied_search =
+            !accessible && io::Error::last_os_error().raw_os_error() == Some(libc::EACCES);
+        if accessible && candidate.is_file() {
             return candidate;
         }
-        if denied.is_none() && candidate.exists() {
+        // exists() is false when an ancestor cannot be searched. Keep that
+        // candidate so exec captures EACCES rather than trying a bare name.
+        if denied.is_none() && (denied_search || candidate.exists()) {
             denied = Some(candidate);
         }
     }
