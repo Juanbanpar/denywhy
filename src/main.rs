@@ -1,6 +1,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::ffi::OsString;
+use std::path::PathBuf;
+mod fs;
 mod trace;
 
 fn main() {
@@ -21,7 +23,25 @@ fn main() {
                 if let Some(call) = &event.decoded {
                     eprintln!("{} {:?}", call.name, call.operation);
                     for path in &call.paths {
-                        eprintln!("dirfd={} path={:?}", path.dirfd, path.path);
+                        eprintln!(
+                            "dirfd={} path={:?} base={:?}",
+                            path.dirfd, path.path, path.base
+                        );
+                        if let Ok(base) = &path.base {
+                            let walk = fs::path::walk(
+                                &PathBuf::from(format!("/proc/{}/root", event.tid)),
+                                base,
+                                &path.path,
+                                true,
+                            );
+                            eprintln!(
+                                "resolved={:?} missing={} limitation={:?}",
+                                walk.target, walk.missing, walk.limitation
+                            );
+                            for c in walk.components {
+                                eprintln!("{:?} {:?} {:?}", c.path, c.inspection_path, c.metadata);
+                            }
+                        }
                     }
                 }
                 if let Some(limitation) = &event.limitation {

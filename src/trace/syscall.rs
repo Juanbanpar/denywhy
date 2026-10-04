@@ -28,6 +28,7 @@ pub enum Operation {
 pub struct PathArgument {
     pub dirfd: i32,
     pub path: PathBuf,
+    pub base: Result<PathBuf, String>,
 }
 
 #[derive(Debug)]
@@ -278,10 +279,10 @@ pub fn decode(
 fn capture_path(tid: i32, name: &str, dirfd: i32, pointer: u64) -> Result<PathArgument, String> {
     let bytes = memory::read_c_string(tid, pointer, libc::PATH_MAX as usize + 256)
         .map_err(|e| format!("cannot capture {name} pathname at {pointer:#x}: {e}"))?;
-    Ok(PathArgument {
-        dirfd,
-        path: PathBuf::from(OsString::from_vec(bytes)),
-    })
+    let path = PathBuf::from(OsString::from_vec(bytes));
+    let base = crate::fs::path::capture_base(tid, dirfd, &path)
+        .map_err(|e| format!("cannot resolve {name} dirfd {dirfd}: {e}"));
+    Ok(PathArgument { dirfd, path, base })
 }
 
 #[cfg(test)]
