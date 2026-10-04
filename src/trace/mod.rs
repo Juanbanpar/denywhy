@@ -18,6 +18,7 @@ pub struct Failure {
     pub context: Option<crate::procfs::status::ProcessContext>,
     pub paths: Vec<crate::fs::path::Walk>,
     pub causes: Vec<crate::model::Cause>,
+    pub mounts: Vec<serde_json::Value>,
 }
 
 pub struct Outcome {
@@ -220,6 +221,7 @@ fn trace(child: i32) -> io::Result<Outcome> {
                                 context,
                                 paths,
                                 causes: Vec::new(),
+                                mounts: Vec::new(),
                             };
                             crate::analyze::analyze_denial(&mut failure);
                             failures.push(failure);

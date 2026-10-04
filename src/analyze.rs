@@ -5,6 +5,7 @@ use serde_json::json;
 use std::os::unix::fs::MetadataExt;
 
 pub fn analyze_denial(event: &mut Failure) {
+    analyze_mounts(event);
     let (Some(call), Some(context)) = (&event.decoded, &event.context) else {
         return;
     };
@@ -186,5 +187,71 @@ fn permission_name(bits: u16) -> &'static str {
         4 => "read",
         6 => "read/write",
         _ => "requested access",
+    }
+}
+
+fn analyze_mounts(event: &mut Failure) {
+    let Some(call) = &event.decoded else {
+        return;
+    };
+    let mounts = std::fs::read(format!("/proc/{}/mountinfo", event.tid))
+        .map_err(|e| e.to_string())
+        .and_then(|b| crate::procfs::mountinfo::parse(&b));
+    let mounts = match mounts {
+        Ok(m) => m,
+        Err(e) => {
+            event
+                .limitations
+                .push(format!("tracee mount state unavailable: {e}"));
+            return;
+        }
+    };
+    for (index, walk) in event.paths.iter().enumerate() {
+        if walk.limitation.is_some() {
+            continue;
+        }
+        match crate::procfs::mountinfo::containing(&mounts, &walk.target) {
+            Ok(Some(mount)) => {
+                let evidence = json!({"path": crate::output::bytes(walk.target.as_os_str()), "mount_id": mount.id, "mountpoint": crate::output::bytes(mount.point.as_os_str()), "root": crate::output::bytes(mount.root.as_os_str()), "read_only": mount.read_only, "noexec": mount.noexec, "nosuid": mount.nosuid, "nodev": mount.nodev});
+                event.mounts.push(evidence.clone());
+                if event.errno == libc::EACCES
+                    && matches!(call.operation, Operation::Execute { .. })
+                    && mount.noexec
+                    && !walk.missing
+                {
+                    event.causes.push(Cause {
+                        kind: CauseKind::NoExecMount,
+                        confidence: Confidence::Proven,
+                        summary: "executable is on a noexec mount".into(),
+                        evidence,
+                    });
+                } else if event.errno == libc::EROFS
+                    && modifying(&call.operation, index)
+                    && mount.read_only
+                {
+                    event.causes.push(Cause {
+                        kind: CauseKind::ReadOnlyMount,
+                        confidence: Confidence::Proven,
+                        summary: "filesystem is mounted read-only".into(),
+                        evidence,
+                    });
+                }
+            }
+            Ok(None) => event
+                .limitations
+                .push(format!("no mount matches {:?}", walk.target)),
+            Err(e) => event.limitations.push(e),
+        }
+    }
+}
+fn modifying(operation: &Operation, index: usize) -> bool {
+    match *operation {
+        Operation::Open { flags, .. } => {
+            flags & (libc::O_ACCMODE | libc::O_CREAT | libc::O_TRUNC) as u64 != 0
+        }
+        Operation::Access { mode, .. } => mode & libc::W_OK as u32 != 0,
+        Operation::Execute { .. } => false,
+        Operation::Link { .. } => index == 1,
+        _ => true,
     }
 }
