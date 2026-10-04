@@ -90,7 +90,13 @@ impl DecodedCall {
                 flags & libc::AT_SYMLINK_NOFOLLOW as u32 == 0
             }
             Operation::Execute { flags } => flags & libc::AT_SYMLINK_NOFOLLOW as u32 == 0,
-            Operation::Open { flags, .. } => flags & libc::O_NOFOLLOW as u64 == 0,
+            Operation::Open { flags, .. } => {
+                // O_CREAT|O_EXCL rejects an existing symlink without following
+                // it, even when O_NOFOLLOW was not supplied.
+                flags & libc::O_NOFOLLOW as u64 == 0
+                    && flags & (libc::O_CREAT | libc::O_EXCL) as u64
+                        != (libc::O_CREAT | libc::O_EXCL) as u64
+            }
             _ => true,
         }
     }
@@ -354,6 +360,23 @@ mod tests {
                 .contains("i386")
         );
         assert!(decode(0, NATIVE_ARCH, 0x40000000, [0; 6]).is_err());
+    }
+    #[test]
+    fn exclusive_creation_does_not_follow_the_final_symlink() {
+        let mut call = DecodedCall {
+            name: "openat",
+            paths: vec![],
+            operation: Operation::Open {
+                flags: (libc::O_CREAT | libc::O_EXCL) as u64,
+                resolve: 0,
+            },
+        };
+        assert!(!call.follows_final(0));
+        call.operation = Operation::Open {
+            flags: libc::O_CREAT as u64,
+            resolve: 0,
+        };
+        assert!(call.follows_final(0));
     }
     #[test]
     fn captures_openat_at_entry() {
