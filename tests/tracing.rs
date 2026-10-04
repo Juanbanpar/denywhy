@@ -76,8 +76,8 @@ fn fixture() -> tempfile::TempDir {
     }
     dir
 }
-fn run(mode: &str, dir: &Path) -> Value {
-    let result = output(
+fn run_output(mode: &str, dir: &Path) -> Output {
+    output(
         Command::new(env!("CARGO_BIN_EXE_denywhy"))
             .args([
                 "--json",
@@ -91,7 +91,10 @@ fn run(mode: &str, dir: &Path) -> Value {
             ])
             .env("DENYWHY_FIXTURE_MODE", mode)
             .env("DENYWHY_FIXTURE_DIR", dir),
-    );
+    )
+}
+fn run(mode: &str, dir: &Path) -> Value {
+    let result = run_output(mode, dir);
     assert_eq!(
         result.status.code(),
         Some(0),
@@ -236,6 +239,50 @@ fn preserves_signal_termination() {
 }
 
 #[test]
+fn diagnoses_private_noexec_and_read_only_mounts_when_namespaces_are_available() {
+    if !available() {
+        return;
+    }
+    for (mode, kind, errno) in [
+        ("mount_noexec", "no_exec_mount", "EACCES"),
+        ("mount_ro", "read_only_mount", "EROFS"),
+    ] {
+        let dir = fixture();
+        fs::create_dir(dir.path().join("mount")).unwrap();
+        let result = run_output(mode, dir.path());
+        fs::set_permissions(
+            dir.path().join("blocked"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        if result.status.code() == Some(77) {
+            eprintln!("SKIP: host disallows private user/mount namespaces");
+            continue;
+        }
+        assert_eq!(
+            result.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let report: Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert!(
+            report["denials"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["errno"] == errno
+                    && d["causes"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|c| c["kind"] == kind && c["confidence"] == "proven")),
+            "{report}"
+        );
+    }
+}
+
+#[test]
 fn forwards_interrupt_and_termination_without_stranding_tracees() {
     if !available() {
         return;
@@ -315,6 +362,9 @@ fn tracee_helper() {
     let new = CString::new(dir.join("blocked/new").as_os_str().as_bytes()).unwrap();
     let absolute_dir = CString::new(dir.as_os_str().as_bytes()).unwrap();
     let relative = c"blocked/file";
+    if mode.starts_with("mount_") {
+        mount_helper(&dir, mode == "mount_ro");
+    }
     if mode == "pause" {
         fs::write(dir.join("ready"), std::process::id().to_string()).unwrap();
         loop {
@@ -487,5 +537,100 @@ unsafe fn install_filter(errno: i32) {
     unsafe {
         assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
         assert_eq!(libc::prctl(libc::PR_SET_SECCOMP, 2, &program), 0);
+    }
+}
+
+fn mount_helper(dir: &Path, read_only: bool) {
+    // Prepare every buffer before fork: libtest has other threads, so the child
+    // must avoid allocator and Rust I/O locks while preparing its private mount.
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+    let uid_map = format!("0 {uid} 1\n");
+    let gid_map = format!("0 {gid} 1\n");
+    let target = CString::new(dir.join("mount").as_os_str().as_bytes()).unwrap();
+    let program = CString::new(dir.join("mount/program").as_os_str().as_bytes()).unwrap();
+    let new = CString::new(dir.join("mount/new").as_os_str().as_bytes()).unwrap();
+    // Only private namespaces and paths beneath the test's temporary directory
+    // are mutated. All C strings remain live until the child exits or execs.
+    unsafe {
+        let child = libc::fork();
+        assert!(child >= 0);
+        if child == 0 {
+            if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) < 0 {
+                libc::_exit(77);
+            }
+            for (path, bytes) in [
+                (c"/proc/self/setgroups", b"deny".as_slice()),
+                (c"/proc/self/uid_map", uid_map.as_bytes()),
+                (c"/proc/self/gid_map", gid_map.as_bytes()),
+            ] {
+                let fd = libc::open(path.as_ptr(), libc::O_WRONLY);
+                if fd < 0
+                    || libc::write(fd, bytes.as_ptr().cast(), bytes.len()) != bytes.len() as isize
+                {
+                    libc::_exit(77);
+                }
+                libc::close(fd);
+            }
+            if libc::mount(
+                c"tmpfs".as_ptr(),
+                target.as_ptr(),
+                c"tmpfs".as_ptr(),
+                libc::MS_NOSUID | libc::MS_NODEV,
+                std::ptr::null(),
+            ) < 0
+            {
+                libc::_exit(77);
+            }
+            let fd = libc::open(program.as_ptr(), libc::O_WRONLY | libc::O_CREAT, 0o755);
+            let script = b"#!/bin/sh\nexit 0\n";
+            if fd < 0
+                || libc::write(fd, script.as_ptr().cast(), script.len()) != script.len() as isize
+            {
+                libc::_exit(78);
+            }
+            libc::close(fd);
+            let flags = libc::MS_REMOUNT
+                | libc::MS_NOSUID
+                | libc::MS_NODEV
+                | if read_only {
+                    libc::MS_RDONLY
+                } else {
+                    libc::MS_NOEXEC
+                };
+            if libc::mount(
+                std::ptr::null(),
+                target.as_ptr(),
+                std::ptr::null(),
+                flags,
+                std::ptr::null(),
+            ) < 0
+            {
+                libc::_exit(77);
+            }
+            let result = if read_only {
+                libc::syscall(libc::SYS_mkdirat, libc::AT_FDCWD, new.as_ptr(), 0o700)
+            } else {
+                let argv = [program.as_ptr(), std::ptr::null()];
+                libc::execv(program.as_ptr(), argv.as_ptr()) as libc::c_long
+            };
+            libc::_exit(
+                if result == -1
+                    && *libc::__errno_location()
+                        == if read_only { libc::EROFS } else { libc::EACCES }
+                {
+                    0
+                } else {
+                    79
+                },
+            );
+        }
+        let mut status = 0;
+        assert_eq!(libc::waitpid(child, &mut status, 0), child);
+        libc::_exit(if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            80
+        });
     }
 }
