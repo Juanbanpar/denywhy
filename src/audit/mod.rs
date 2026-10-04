@@ -133,9 +133,19 @@ pub fn correlate_after_exit(failures: &mut [Failure]) {
             Err(e) => journal_error = Some(e),
         }
     }
-    for failure in failures {
+    let mut assignments: Vec<Vec<&parse::AuditEvent>> =
+        (0..failures.len()).map(|_| Vec::new()).collect();
+    let mut ambiguous = false;
+    for event in &events {
+        match correlate::assign(event, failures) {
+            Ok(Some(index)) => assignments[index].push(event),
+            Ok(None) => {}
+            Err(()) => ambiguous = true,
+        }
+    }
+    for (failure, assigned) in failures.iter_mut().zip(assignments) {
         let mut matched_ids = std::collections::HashSet::new();
-        for event in &events {
+        for event in assigned {
             if correlate::matches(event, failure)
                 && matched_ids.insert((event.raw_id.clone(), format!("{:?}", event.mechanism)))
             {
@@ -164,6 +174,11 @@ pub fn correlate_after_exit(failures: &mut [Failure]) {
                     .collect();
                 failure.causes.insert(0, Cause { kind: event.mechanism.clone(), confidence: Confidence::Proven, summary: "matching MAC audit denial".into(), evidence: json!({"audit_id": event.raw_id, "operation": event.operation, "path": event.path.as_ref().map(|p| crate::output::bytes(p.as_os_str())), "fields": fields}) });
             }
+        }
+        if ambiguous {
+            failure.limitations.push(
+                "Some audit records could not be assigned uniquely to repeated syscalls.".into(),
+            );
         }
         if matched_ids.is_empty() {
             failure.limitations.push(if let (Err(file_error), Some(journal_error)) = (&file, &journal_error) {

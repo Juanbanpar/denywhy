@@ -16,12 +16,20 @@ pub fn matches(event: &AuditEvent, failure: &Failure) -> bool {
     if pid != failure.tid as u32 && Some(pid) != failure.context.as_ref().map(|c| c.tgid) {
         return false;
     }
-    let distance = event
+    // Audit timestamps are assigned in the kernel before the syscall returns.
+    // A one-millisecond allowance covers the audit timestamp's precision.
+    if event
         .timestamp
         .duration_since(failure.timestamp)
-        .or_else(|_| failure.timestamp.duration_since(event.timestamp))
-        .unwrap();
-    if distance > Duration::from_millis(250) {
+        .is_ok_and(|d| d > Duration::from_millis(1))
+    {
+        return false;
+    }
+    if failure
+        .timestamp
+        .duration_since(event.timestamp)
+        .is_ok_and(|d| d > Duration::from_millis(250))
+    {
         return false;
     }
     if event.arch.is_some_and(|arch| arch != failure.arch)
@@ -69,6 +77,34 @@ pub fn matches(event: &AuditEvent, failure: &Failure) -> bool {
             .as_ref()
             .is_some_and(|operation| operation_matches(&event.mechanism, operation, call))
 }
+pub fn assign(event: &AuditEvent, failures: &[Failure]) -> Result<Option<usize>, ()> {
+    let mut candidates: Vec<_> = failures
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| matches(event, f))
+        .map(|(index, f)| {
+            (
+                index,
+                f.timestamp
+                    .duration_since(event.timestamp)
+                    .or_else(|_| event.timestamp.duration_since(f.timestamp))
+                    .unwrap(),
+            )
+        })
+        .collect();
+    candidates.sort_by_key(|(_, distance)| *distance);
+    let Some((index, distance)) = candidates.first() else {
+        return Ok(None);
+    };
+    if candidates
+        .get(1)
+        .is_some_and(|(_, next)| next.saturating_sub(*distance) <= Duration::from_millis(1))
+    {
+        return Err(());
+    }
+    Ok(Some(*index))
+}
+
 fn operation_matches(mechanism: &CauseKind, operation: &str, call: &DecodedCall) -> bool {
     let accepted: &[&str] = match mechanism {
         CauseKind::AppArmor => match call.operation {
@@ -161,7 +197,7 @@ mod tests {
     #[test]
     fn rejects_pid_reuse_wrong_paths_operations_and_timestamps() {
         let time = UNIX_EPOCH + Duration::from_secs(1700000000);
-        let mut failure = Failure {
+        let failure = Failure {
             tid: 42,
             number: libc::SYS_openat as u64,
             arch: crate::trace::syscall::NATIVE_ARCH,
@@ -187,7 +223,47 @@ mod tests {
             timestamp: time,
         };
         let mut event = parse::parse(b"type=AVC msg=audit(1700000000.001:1): apparmor=\"DENIED\" pid=42 operation=\"open\" name=\"/private/file\"\n").remove(0);
+        assert_eq!(assign(&event, std::slice::from_ref(&failure)), Ok(Some(0)));
+        let twin = Failure {
+            tid: 42,
+            number: libc::SYS_openat as u64,
+            arch: crate::trace::syscall::NATIVE_ARCH,
+            args: [0; 6],
+            errno: libc::EACCES,
+            decoded: Some(DecodedCall {
+                name: "openat",
+                operation: Operation::Open {
+                    flags: 0,
+                    resolve: 0,
+                },
+                paths: vec![crate::trace::syscall::PathArgument {
+                    dirfd: libc::AT_FDCWD,
+                    path: PathBuf::from("/private/file"),
+                    base: Ok(PathBuf::from("/")),
+                }],
+            }),
+            limitations: vec![],
+            context: None,
+            paths: vec![],
+            causes: vec![],
+            mounts: vec![],
+            timestamp: time + Duration::from_micros(500),
+        };
+        let candidates = [failure, twin];
+        assert_eq!(assign(&event, &candidates), Err(()));
+        let mut failure = candidates.into_iter().next().unwrap();
+        for line in [
+            "type=AVC msg=audit(1700000000.001:2): avc: denied { read } for pid=42 name=\"/private/file\" permissive=0\n".to_owned(),
+            format!(
+                "type=SYSCALL msg=audit(1700000000.001:3): arch={:x} syscall={} pid=42 exit=-13\ntype=LANDLOCK_ACCESS msg=audit(1700000000.001:3): blockers=fs.read_file path=\"/private/file\"\n",
+                failure.arch, failure.number
+            ),
+        ] {
+            assert!(matches(&parse::parse(line.as_bytes())[0], &failure));
+        }
         assert!(matches(&event, &failure));
+        event.pid = None;
+        assert!(!matches(&event, &failure));
         event.pid = Some(43);
         assert!(!matches(&event, &failure));
         event.pid = Some(42);

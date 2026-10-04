@@ -70,6 +70,16 @@ fn tokens(line: &[u8]) -> HashMap<String, Vec<u8>> {
     }
     fields
 }
+fn avc_denied(line: &[u8]) -> bool {
+    let Some(end) = line.windows(2).position(|w| w == b"):") else {
+        return false;
+    };
+    line[end + 2..]
+        .trim_ascii_start()
+        .strip_prefix(b"avc:")
+        .is_some_and(|rest| rest.trim_ascii_start().starts_with(b"denied "))
+}
+
 fn audit_id(line: &[u8]) -> Option<(String, SystemTime)> {
     let index = line.windows(6).position(|w| w == b"audit(")? + 6;
     let end = line[index..].iter().position(|b| *b == b')')? + index;
@@ -132,12 +142,13 @@ pub fn parse(bytes: &[u8]) -> Vec<AuditEvent> {
         for (line, fields) in lines.iter().zip(records) {
             let mechanism = if fields.get("apparmor").is_some_and(|v| v == b"DENIED") {
                 CauseKind::AppArmor
-            } else if line.windows(4).any(|w| w == b"avc:")
-                && line.windows(6).any(|w| w == b"denied")
-            {
+            } else if avc_denied(line) {
                 CauseKind::Selinux
             } else if fields.get("type").is_some_and(|v| {
-                v == b"LANDLOCK_ACCESS" || v == b"AUDIT_LANDLOCK_ACCESS" || v == b"1423"
+                v == b"LANDLOCK_ACCESS"
+                    || v == b"AUDIT_LANDLOCK_ACCESS"
+                    || v == b"1423"
+                    || v == b"UNKNOWN[1423]"
             }) {
                 CauseKind::Landlock
             } else {
@@ -224,6 +235,10 @@ type=LANDLOCK_ACCESS msg=audit(1700000000.300:3): domain=123 blockers=fs.read_fi
         );
         assert_eq!(events[2].pid, Some(42));
         assert_eq!(events[2].syscall, Some(257));
+        assert!(
+            parse(b"type=AVC msg=audit(1.0:1): avc: granted { read } pid=42 comm=\"denied\"\n")
+                .is_empty()
+        );
         assert!(parse(b"type=AVC msg=audit(bad): avc: denied { read }").is_empty());
         assert!(
             parse(b"type=AVC msg=audit(1.0:1): avc: denied { read } pid=42 permissive=1")
