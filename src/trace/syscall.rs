@@ -10,8 +10,9 @@ pub const NATIVE_ARCH: u32 = 0xc00000b7;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Operation {
-    Open { flags: u64 },
-    Execute,
+    Open { flags: u64, resolve: u64 },
+    Access { mode: u32, flags: u32 },
+    Execute { flags: u32 },
     Create,
     Remove { directory: bool },
 }
@@ -47,11 +48,19 @@ pub fn decode(
     let (name, operation, dirfd, pointer) = match number as libc::c_long {
         libc::SYS_openat => (
             "openat",
-            Operation::Open { flags: args[2] },
+            Operation::Open {
+                flags: args[2],
+                resolve: 0,
+            },
             args[0] as i32,
             args[1],
         ),
-        libc::SYS_execve => ("execve", Operation::Execute, libc::AT_FDCWD, args[0]),
+        libc::SYS_execve => (
+            "execve",
+            Operation::Execute { flags: 0 },
+            libc::AT_FDCWD,
+            args[0],
+        ),
         libc::SYS_mkdirat => ("mkdirat", Operation::Create, args[0] as i32, args[1]),
         libc::SYS_unlinkat => (
             "unlinkat",
@@ -60,6 +69,80 @@ pub fn decode(
             },
             args[0] as i32,
             args[1],
+        ),
+        libc::SYS_openat2 => {
+            if args[3] < 24 {
+                return Err("openat2 open_how is too short to capture".into());
+            }
+            let how = memory::read_bytes(tid, args[2], 24)
+                .map_err(|e| format!("cannot capture openat2 open_how: {e}"))?;
+            if how.len() != 24 {
+                return Err("short openat2 open_how read".into());
+            }
+            (
+                "openat2",
+                Operation::Open {
+                    flags: u64::from_ne_bytes(how[..8].try_into().unwrap()),
+                    resolve: u64::from_ne_bytes(how[16..24].try_into().unwrap()),
+                },
+                args[0] as i32,
+                args[1],
+            )
+        }
+        libc::SYS_faccessat => (
+            "faccessat",
+            Operation::Access {
+                mode: args[2] as u32,
+                flags: 0,
+            },
+            args[0] as i32,
+            args[1],
+        ),
+        libc::SYS_faccessat2 => (
+            "faccessat2",
+            Operation::Access {
+                mode: args[2] as u32,
+                flags: args[3] as u32,
+            },
+            args[0] as i32,
+            args[1],
+        ),
+        libc::SYS_execveat => (
+            "execveat",
+            Operation::Execute {
+                flags: args[4] as u32,
+            },
+            args[0] as i32,
+            args[1],
+        ),
+        #[cfg(target_arch = "x86_64")]
+        libc::SYS_open => (
+            "open",
+            Operation::Open {
+                flags: args[1],
+                resolve: 0,
+            },
+            libc::AT_FDCWD,
+            args[0],
+        ),
+        #[cfg(target_arch = "x86_64")]
+        libc::SYS_access => (
+            "access",
+            Operation::Access {
+                mode: args[1] as u32,
+                flags: 0,
+            },
+            libc::AT_FDCWD,
+            args[0],
+        ),
+        #[cfg(target_arch = "x86_64")]
+        libc::SYS_mkdir => ("mkdir", Operation::Create, libc::AT_FDCWD, args[0]),
+        #[cfg(target_arch = "x86_64")]
+        libc::SYS_unlink => (
+            "unlink",
+            Operation::Remove { directory: false },
+            libc::AT_FDCWD,
+            args[0],
         ),
         _ => return Ok(None),
     };
@@ -113,7 +196,8 @@ mod tests {
         assert_eq!(
             call.operation,
             Operation::Open {
-                flags: libc::O_RDWR as u64
+                flags: libc::O_RDWR as u64,
+                resolve: 0
             }
         );
     }
