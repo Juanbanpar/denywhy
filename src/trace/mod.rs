@@ -6,7 +6,7 @@ use ptrace::{SyscallInfo, ptrace, wait};
 use std::time::SystemTime;
 pub mod syscall;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, OsString};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -123,9 +123,36 @@ struct Tracee {
     tgid: Option<i32>,
     pending: Option<PendingSyscall>,
     newborn: bool,
+    fork_announced: bool,
 }
 struct Tracees {
     threads: HashMap<i32, Tracee>,
+    exited_before_announcement: HashSet<i32>,
+}
+impl Tracees {
+    fn exited(&mut self, tid: i32) {
+        if self
+            .threads
+            .remove(&tid)
+            .is_none_or(|state| !state.fork_announced)
+        {
+            self.exited_before_announcement.insert(tid);
+        }
+    }
+    fn announce(&mut self, tid: i32) {
+        // Child stops can arrive before the parent's fork event. If that child
+        // has already been reaped, the late announcement must not resurrect it.
+        if self.exited_before_announcement.remove(&tid) {
+            return;
+        }
+        self.threads
+            .entry(tid)
+            .or_insert_with(|| Tracee {
+                newborn: true,
+                ..Tracee::default()
+            })
+            .fork_announced = true;
+    }
 }
 impl Drop for Tracees {
     fn drop(&mut self) {
@@ -158,7 +185,14 @@ impl Drop for Tracees {
 
 fn trace(child: i32) -> io::Result<Outcome> {
     let mut tracees = Tracees {
-        threads: HashMap::from([(child, Tracee::default())]),
+        threads: HashMap::from([(
+            child,
+            Tracee {
+                fork_announced: true,
+                ..Tracee::default()
+            },
+        )]),
+        exited_before_announcement: HashSet::new(),
     };
     let (_, status) = wait_for_tracees(&tracees)?;
     if libc::WIFSIGNALED(status) {
@@ -204,7 +238,7 @@ fn trace(child: i32) -> io::Result<Outcome> {
     while !tracees.threads.is_empty() {
         let (tid, status) = wait_for_tracees(&tracees)?;
         if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
-            tracees.threads.remove(&tid);
+            tracees.exited(tid);
             if tid == child {
                 main_exit = Some(if libc::WIFEXITED(status) {
                     (libc::WEXITSTATUS(status), None)
@@ -237,10 +271,7 @@ fn trace(child: i32) -> io::Result<Outcome> {
             match event {
                 libc::PTRACE_EVENT_FORK | libc::PTRACE_EVENT_VFORK | libc::PTRACE_EVENT_CLONE => {
                     let new_tid = event_message(tid)? as i32;
-                    tracees.threads.entry(new_tid).or_insert_with(|| Tracee {
-                        newborn: true,
-                        ..Tracee::default()
-                    });
+                    tracees.announce(new_tid);
                 }
                 libc::PTRACE_EVENT_EXEC => {
                     let old_tid = event_message(tid)? as i32;
@@ -310,6 +341,12 @@ fn wait_for_tracees(tracees: &Tracees) -> io::Result<(i32, i32)> {
         signals::forward(tracees.threads.keys().copied());
         match wait() {
             Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+            Err(e) if e.raw_os_error() == Some(libc::ECHILD) => {
+                return Err(io::Error::other(format!(
+                    "waitpid found no tracees, but TIDs {:?} remain tracked",
+                    tracees.threads.keys().collect::<Vec<_>>()
+                )));
+            }
             result => return result,
         }
     }
@@ -448,6 +485,24 @@ fn capture_failure(tid: i32, pending: PendingSyscall, errno: i32) -> Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn late_fork_announcement_does_not_resurrect_a_reaped_child() {
+        // Outside Linux's PID range, so even a failing assertion cannot signal
+        // an unrelated process through the cleanup guard.
+        let tid = i32::MAX;
+        let mut tracees = Tracees {
+            threads: HashMap::from([(tid, Tracee::default())]),
+            exited_before_announcement: HashSet::new(),
+        };
+        tracees.exited(tid);
+        tracees.announce(tid);
+        assert!(tracees.threads.is_empty());
+        assert!(tracees.exited_before_announcement.is_empty());
+        // A child killed before its first stop has the same event ordering.
+        tracees.exited(tid);
+        tracees.announce(tid);
+        assert!(tracees.threads.is_empty());
+    }
     #[test]
     fn unresolved_first_path_cannot_shift_second_path_evidence() {
         let pending = PendingSyscall {

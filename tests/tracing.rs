@@ -98,7 +98,7 @@ fn run(mode: &str, dir: &Path) -> Value {
     assert_eq!(
         result.status.code(),
         Some(0),
-        "{}",
+        "fixture {mode}: {}",
         String::from_utf8_lossy(&result.stderr)
     );
     serde_json::from_slice(&result.stdout).unwrap_or_else(|e| {
