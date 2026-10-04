@@ -398,18 +398,21 @@ fn capture_failure(tid: i32, pending: PendingSyscall, errno: i32) -> Failure {
     let paths = decoded
         .as_ref()
         .map(|call| {
+            // Keep positional correspondence for rename/link. Dropping one
+            // unresolved path would associate the other inode with wrong args.
+            if call.paths.iter().any(|p| p.base.is_err()) {
+                return Vec::new();
+            }
             call.paths
                 .iter()
                 .enumerate()
-                .filter_map(|(i, p)| {
-                    p.base.as_ref().ok().map(|base| {
-                        crate::fs::path::walk(
-                            &PathBuf::from(format!("/proc/{tid}/root")),
-                            base,
-                            &p.path,
-                            call.follows_final(i),
-                        )
-                    })
+                .map(|(i, p)| {
+                    crate::fs::path::walk(
+                        &PathBuf::from(format!("/proc/{tid}/root")),
+                        p.base.as_ref().unwrap(),
+                        &p.path,
+                        call.follows_final(i),
+                    )
                 })
                 .collect()
         })
@@ -434,5 +437,43 @@ fn capture_failure(tid: i32, pending: PendingSyscall, errno: i32) -> Failure {
         causes: Vec::new(),
         mounts: Vec::new(),
         timestamp,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn unresolved_first_path_cannot_shift_second_path_evidence() {
+        let pending = PendingSyscall {
+            arch: syscall::NATIVE_ARCH,
+            number: libc::SYS_renameat as u64,
+            args: [0; 6],
+            context: None,
+            decoded: Ok(Some(syscall::DecodedCall {
+                name: "renameat",
+                operation: syscall::Operation::Rename { flags: 0 },
+                paths: vec![
+                    syscall::PathArgument {
+                        dirfd: 99,
+                        path: "source".into(),
+                        base: Err("source dirfd unavailable".into()),
+                    },
+                    syscall::PathArgument {
+                        dirfd: libc::AT_FDCWD,
+                        path: "/tmp".into(),
+                        base: Ok("/".into()),
+                    },
+                ],
+            })),
+        };
+        let failure = capture_failure(std::process::id() as i32, pending, libc::EACCES);
+        assert!(failure.paths.is_empty());
+        assert!(
+            failure
+                .limitations
+                .iter()
+                .any(|l| l.contains("source dirfd unavailable"))
+        );
     }
 }
