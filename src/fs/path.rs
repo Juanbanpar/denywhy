@@ -1,8 +1,10 @@
 use std::collections::VecDeque;
+use std::ffi::CString;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
 
 pub fn capture_base(tid: i32, dirfd: i32, path: &Path) -> io::Result<PathBuf> {
     if path.is_absolute() {
@@ -37,14 +39,28 @@ pub struct Walk {
 }
 
 fn pieces(path: &Path) -> VecDeque<OsString> {
-    path.components()
-        .filter_map(|c| match c {
-            Component::Normal(p) => Some(p.to_owned()),
-            Component::ParentDir => Some(OsString::from("..")),
-            Component::CurDir => Some(OsString::from(".")),
-            _ => None,
-        })
-        .collect()
+    // Path::components normalizes interior '.' and trailing slashes. The kernel
+    // still requires the preceding object to be a directory in those cases.
+    let mut pieces: VecDeque<_> = path
+        .as_os_str()
+        .as_bytes()
+        .split(|b| *b == b'/')
+        .filter(|p| !p.is_empty())
+        .map(|p| OsString::from_vec(p.to_vec()))
+        .collect();
+    if path.as_os_str().as_bytes().ends_with(b"/") {
+        pieces.push_back(OsString::from("."));
+    }
+    pieces
+}
+fn procfs(path: &Path) -> bool {
+    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // statfs is POD. The C string and output structure remain live for the call.
+    let mut state: libc::statfs = unsafe { std::mem::zeroed() };
+    // The kernel fills the full statfs buffer; no tracee pointer is dereferenced.
+    unsafe { libc::statfs(path.as_ptr(), &mut state) == 0 && state.f_type == 0x9fa0 }
 }
 
 pub fn walk(root: &Path, base: &Path, path: &Path, follow_final: bool) -> Walk {
@@ -78,6 +94,10 @@ pub fn walk(root: &Path, base: &Path, path: &Path, follow_final: bool) -> Walk {
                 break;
             }
         }
+        if !queue.is_empty() && components.last().is_some_and(|c| !c.metadata.is_dir()) {
+            limitation = Some(format!("non-directory path component {current:?}"));
+            break;
+        }
         let Some(piece) = queue.pop_front() else {
             break;
         };
@@ -95,6 +115,12 @@ pub fn walk(root: &Path, base: &Path, path: &Path, follow_final: bool) -> Walk {
         let inspection = root.join(next.strip_prefix("/").unwrap());
         match fs::symlink_metadata(&inspection) {
             Ok(meta) if meta.file_type().is_symlink() && (follow_final || !queue.is_empty()) => {
+                if procfs(&root.join(current.strip_prefix("/").unwrap())) {
+                    limitation = Some(format!(
+                        "procfs magic-link resolution unavailable at {next:?}"
+                    ));
+                    break;
+                }
                 links += 1;
                 if links > 40 {
                     limitation = Some("symlink resolution exceeds Linux's 40-link limit".into());
@@ -133,17 +159,41 @@ mod tests {
     use super::*;
     #[test]
     fn root_relative_symlinks_and_parent_components() {
-        let root = std::env::temp_dir().join(format!("denywhy-path-{}", std::process::id()));
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
         fs::create_dir_all(root.join("a/b")).unwrap();
         fs::write(root.join("a/file"), b"").unwrap();
         std::os::unix::fs::symlink("/a/file", root.join("link")).unwrap();
-        let result = walk(&root, Path::new("/"), Path::new("link"), true);
+        let result = walk(root, Path::new("/"), Path::new("link"), true);
         assert_eq!(result.target, Path::new("/a/file"));
         assert!(result.limitation.is_none());
-        let result = walk(&root, Path::new("/a/b"), Path::new("../file"), true);
+        let result = walk(root, Path::new("/a/b"), Path::new("../file"), true);
         assert_eq!(result.target, Path::new("/a/file"));
-        let result = walk(&root, Path::new("/a"), Path::new("new"), true);
+        let result = walk(root, Path::new("/a"), Path::new("new"), true);
         assert!(result.missing);
-        fs::remove_dir_all(root).unwrap();
+        let result = walk(root, Path::new("/"), Path::new("a/file/../b"), true);
+        assert!(result.limitation.unwrap().contains("non-directory"));
+        let result = walk(root, Path::new("/a/b"), Path::new("../file"), true);
+        assert_eq!(result.components[0].path, Path::new("/a/b"));
+    }
+}
+
+#[cfg(test)]
+mod proc_tests {
+    use super::*;
+    #[test]
+    fn does_not_resolve_proc_self_as_the_tracer() {
+        let result = walk(
+            Path::new("/"),
+            Path::new("/"),
+            Path::new("/proc/self/exe"),
+            true,
+        );
+        assert!(
+            result
+                .limitation
+                .as_deref()
+                .is_some_and(|s| s.contains("procfs magic-link"))
+        );
     }
 }

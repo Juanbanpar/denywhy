@@ -38,21 +38,24 @@ pub struct ProcessContext {
     pub comm: Option<String>,
 }
 
-fn field<'a>(text: &'a str, name: &str) -> io::Result<&'a str> {
-    text.lines()
+fn field<'a>(text: &'a [u8], name: &str) -> io::Result<&'a str> {
+    let value = text
+        .split(|b| *b == b'\n')
         .find_map(|line| {
-            line.strip_prefix(name)
-                .and_then(|s| s.strip_prefix(':'))
-                .map(str::trim)
+            line.strip_prefix(name.as_bytes())
+                .and_then(|s| s.strip_prefix(b":"))
         })
-        .ok_or_else(|| io::Error::other(format!("/proc/status missing {name}")))
+        .ok_or_else(|| io::Error::other(format!("/proc/status missing {name}")))?;
+    std::str::from_utf8(value)
+        .map(str::trim)
+        .map_err(|_| io::Error::other(format!("malformed /proc/status {name}")))
 }
-fn number(text: &str, name: &str) -> io::Result<u32> {
+fn number(text: &[u8], name: &str) -> io::Result<u32> {
     field(text, name)?
         .parse()
         .map_err(|_| io::Error::other(format!("malformed /proc/status {name}")))
 }
-fn ids(text: &str, name: &str) -> io::Result<[u32; 4]> {
+fn ids(text: &[u8], name: &str) -> io::Result<[u32; 4]> {
     let values: Vec<u32> = field(text, name)?
         .split_whitespace()
         .map(str::parse)
@@ -62,12 +65,13 @@ fn ids(text: &str, name: &str) -> io::Result<[u32; 4]> {
         .try_into()
         .map_err(|_| io::Error::other(format!("/proc/status {name} needs four IDs")))
 }
-fn cap(text: &str, name: &str) -> io::Result<u64> {
+fn cap(text: &[u8], name: &str) -> io::Result<u64> {
     u64::from_str_radix(field(text, name)?, 16)
         .map_err(|_| io::Error::other(format!("malformed /proc/status {name}")))
 }
 
-pub fn parse(text: &str) -> io::Result<ProcessContext> {
+pub fn parse(text: impl AsRef<[u8]>) -> io::Result<ProcessContext> {
+    let text = text.as_ref();
     let [ruid, euid, suid, fsuid] = ids(text, "Uid")?;
     let [rgid, egid, sgid, fsgid] = ids(text, "Gid")?;
     Ok(ProcessContext {
@@ -109,7 +113,7 @@ pub fn parse(text: &str) -> io::Result<ProcessContext> {
 }
 
 pub fn capture(tid: i32) -> io::Result<ProcessContext> {
-    let mut context = parse(&fs::read_to_string(format!("/proc/{tid}/status"))?)?;
+    let mut context = parse(fs::read(format!("/proc/{tid}/status"))?)?;
     context.user_namespace_differs = fs::read_link(format!("/proc/{tid}/ns/user"))
         .ok()
         .zip(fs::read_link("/proc/self/ns/user").ok())
@@ -135,7 +139,12 @@ pub fn capture(tid: i32) -> io::Result<ProcessContext> {
             }
             .into(),
         ),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Some("disabled".into()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            fs::read_to_string("/sys/kernel/security/lsm")
+                .ok()
+                .filter(|s| !s.trim().split(',').any(|lsm| lsm == "selinux"))
+                .map(|_| "disabled".into())
+        }
         _ => None,
     };
     context.comm = fs::read_to_string(format!("/proc/{tid}/comm"))
@@ -156,12 +165,15 @@ mod tests {
             (1, 4, 8)
         );
         assert_eq!(c.credentials.supplementary_groups, [9, 10]);
+        let mut raw = b"Name: \xff\n".to_vec();
+        raw.extend(text.as_bytes());
+        assert_eq!(parse(raw).unwrap().credentials.fsuid, 4);
         assert_eq!(c.capabilities.effective, 3);
         assert_eq!(c.seccomp_filters, Some(2));
-        assert!(parse(&text.replace("1 2 3 4", "1 2")).is_err());
-        assert!(parse(&text.replace("CapEff:\t03", "CapEff:\tx")).is_err());
+        assert!(parse(text.replace("1 2 3 4", "1 2")).is_err());
+        assert!(parse(text.replace("CapEff:\t03", "CapEff:\tx")).is_err());
         assert_eq!(
-            parse(&text.replace("Seccomp_filters:\t2\n", ""))
+            parse(text.replace("Seccomp_filters:\t2\n", ""))
                 .unwrap()
                 .seccomp_filters,
             None

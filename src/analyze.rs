@@ -5,6 +5,18 @@ use serde_json::json;
 use std::os::unix::fs::MetadataExt;
 
 pub fn analyze_denial(event: &mut Failure) {
+    if let Some(call) = &event.decoded && (call.paths.iter().any(|p| p.path.as_os_str().is_empty() && !matches!(call.operation, Operation::Execute { flags } | Operation::Access { flags, .. } | Operation::Chown { flags, .. } | Operation::Link { flags } if flags & libc::AT_EMPTY_PATH as u32 != 0)) || matches!(call.operation, Operation::Access { mode, .. } if mode & !7 != 0)) {
+        event.limitations.push("invalid pathname or access mode has no DAC/mount interpretation".into()); return;
+    }
+    if event.decoded.as_ref().is_some_and(
+        |call| matches!(call.operation, Operation::Open { resolve, .. } if resolve != 0),
+    ) {
+        event.limitations.push(
+            "openat2 resolution constraints are present; ordinary path resolution may differ."
+                .into(),
+        );
+        return;
+    }
     analyze_mounts(event);
     let (Some(call), Some(context)) = (&event.decoded, &event.context) else {
         return;
@@ -39,13 +51,6 @@ pub fn analyze_denial(event: &mut Failure) {
     if confidence == Confidence::Possible {
         event.limitations.push("User namespace differs from tracer or cannot be inspected; capability-based conclusions may be incomplete.".into());
     }
-    if matches!(call.operation, Operation::Open { resolve, .. } if resolve != 0) {
-        event.limitations.push(
-            "openat2 resolution constraints are present; ordinary path resolution may differ."
-                .into(),
-        );
-        return;
-    }
     if event.paths.len() != call.paths.len() {
         event
             .limitations
@@ -55,6 +60,9 @@ pub fn analyze_denial(event: &mut Failure) {
     for (index, walk) in event.paths.iter().enumerate() {
         if let Some(limitation) = &walk.limitation {
             event.limitations.push(limitation.clone());
+            if limitation.starts_with("non-directory") || limitation.starts_with("procfs magic") {
+                continue;
+            }
         }
         for (component_index, component) in walk.components.iter().enumerate() {
             let final_object = !walk.missing
@@ -62,6 +70,12 @@ pub fn analyze_denial(event: &mut Failure) {
                 && component_index + 1 == walk.components.len();
             let requested = if !final_object {
                 1
+            } else if component.metadata.file_type().is_symlink()
+                || matches!(call.operation, Operation::Execute { .. })
+                    && !component.metadata.is_file()
+                || matches!(call.operation, Operation::Open { flags, .. } if flags & (libc::O_CREAT | libc::O_EXCL) as u64 == (libc::O_CREAT | libc::O_EXCL) as u64)
+            {
+                0
             } else {
                 requested(&call.operation, component.metadata.is_dir())
             };
@@ -86,12 +100,14 @@ pub fn analyze_denial(event: &mut Failure) {
                 )),
             }
         }
-        let target = if !walk.missing {
+        let target = if !walk.missing && walk.limitation.is_none() {
             walk.components.last()
         } else {
             None
         };
-        let parent = if walk.missing {
+        let parent = if walk.limitation.is_some() {
+            None
+        } else if walk.missing {
             walk.components.last()
         } else {
             walk.components.iter().rev().nth(1)
@@ -134,6 +150,17 @@ pub fn analyze_denial(event: &mut Failure) {
             }
         }
     }
+    if event.errno == libc::EPERM
+        && matches!(call.operation, Operation::Mknod { mode } if matches!(mode & libc::S_IFMT, libc::S_IFCHR | libc::S_IFBLK))
+        && capabilities & dac::CAP_MKNOD == 0
+    {
+        event.causes.push(Cause {
+            kind: CauseKind::Capability,
+            confidence,
+            summary: "device-node creation requires CAP_MKNOD".into(),
+            evidence: json!({"required": "CAP_MKNOD", "effective_capabilities": capabilities}),
+        });
+    }
 }
 fn inode(meta: &std::fs::Metadata) -> dac::Inode {
     dac::Inode {
@@ -171,11 +198,8 @@ fn requested(operation: &Operation, directory: bool) -> u16 {
 fn requires_parent_write(operation: &Operation, index: usize, missing: bool) -> bool {
     match *operation {
         Operation::Open { flags, .. } => missing && flags & libc::O_CREAT as u64 != 0,
-        Operation::Create
-        | Operation::Mknod { .. }
-        | Operation::Symlink
-        | Operation::Remove { .. }
-        | Operation::Rename { .. } => true,
+        Operation::Create | Operation::Mknod { .. } | Operation::Symlink => missing,
+        Operation::Remove { .. } | Operation::Rename { .. } => true,
         Operation::Link { .. } => index == 1,
         _ => false,
     }
@@ -212,12 +236,16 @@ fn analyze_mounts(event: &mut Failure) {
         }
         match crate::procfs::mountinfo::containing(&mounts, &walk.target) {
             Ok(Some(mount)) => {
-                let evidence = json!({"path": crate::output::bytes(walk.target.as_os_str()), "mount_id": mount.id, "mountpoint": crate::output::bytes(mount.point.as_os_str()), "root": crate::output::bytes(mount.root.as_os_str()), "read_only": mount.read_only, "noexec": mount.noexec, "nosuid": mount.nosuid, "nodev": mount.nodev});
+                let mut evidence = json!({"path": crate::output::bytes(walk.target.as_os_str()), "mount_id": mount.id, "mountpoint": crate::output::bytes(mount.point.as_os_str()), "root": crate::output::bytes(mount.root.as_os_str()), "read_only": mount.read_only, "noexec": mount.noexec, "nosuid": mount.nosuid, "nodev": mount.nodev});
+                if !matches!(call.operation, Operation::Execute { .. }) {
+                    evidence.as_object_mut().unwrap().remove("nosuid");
+                }
                 event.mounts.push(evidence.clone());
                 if event.errno == libc::EACCES
                     && matches!(call.operation, Operation::Execute { .. })
                     && mount.noexec
                     && !walk.missing
+                    && walk.components.last().is_some_and(|c| c.metadata.is_file())
                 {
                     event.causes.push(Cause {
                         kind: CauseKind::NoExecMount,
@@ -247,7 +275,8 @@ fn analyze_mounts(event: &mut Failure) {
 fn modifying(operation: &Operation, index: usize) -> bool {
     match *operation {
         Operation::Open { flags, .. } => {
-            flags & (libc::O_ACCMODE | libc::O_CREAT | libc::O_TRUNC) as u64 != 0
+            flags & libc::O_PATH as u64 == 0
+                && flags & (libc::O_ACCMODE | libc::O_CREAT | libc::O_TRUNC) as u64 != 0
         }
         Operation::Access { mode, .. } => mode & libc::W_OK as u32 != 0,
         Operation::Execute { .. } => false,
@@ -278,6 +307,17 @@ mod tests {
     use super::*;
     use crate::trace::syscall::{DecodedCall, PathArgument};
     use std::path::PathBuf;
+    #[test]
+    fn creation_only_checks_parent_write_for_new_objects() {
+        assert!(requires_parent_write(&Operation::Create, 0, true));
+        assert!(!requires_parent_write(&Operation::Create, 0, false));
+        assert!(!requires_parent_write(&Operation::Symlink, 0, false));
+        assert!(requires_parent_write(
+            &Operation::Remove { directory: false },
+            0,
+            false
+        ));
+    }
     #[test]
     fn active_seccomp_does_not_become_a_proven_cause() {
         let context = crate::procfs::status::parse("Tgid: 42\nUid: 1000 1000 1000 1000\nGid: 1000 1000 1000 1000\nGroups: 1000\nCapInh: 0\nCapPrm: 0\nCapEff: 0\nCapBnd: 0\nCapAmb: 0\nNoNewPrivs: 1\nSeccomp: 2\nSeccomp_filters: 2\n").unwrap();

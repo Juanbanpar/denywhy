@@ -83,10 +83,6 @@ pub fn ownership_denied(
                         && gid != credentials.fsgid
                         && !credentials.supplementary_groups.contains(&gid)))
         }
-        Operation::Mknod { mode } => {
-            matches!(mode & libc::S_IFMT, libc::S_IFCHR | libc::S_IFBLK)
-                && capabilities & CAP_MKNOD == 0
-        }
         _ => false,
     }
 }

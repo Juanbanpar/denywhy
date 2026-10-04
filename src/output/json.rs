@@ -19,6 +19,7 @@ fn event(group: &Group<'_>) -> Value {
     let path = event
         .paths
         .first()
+        .filter(|walk| walk.limitation.is_none())
         .map(|p| p.target.as_os_str())
         .or_else(|| {
             event

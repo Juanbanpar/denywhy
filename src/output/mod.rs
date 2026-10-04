@@ -37,19 +37,12 @@ pub fn groups(failures: &[Failure]) -> Vec<Group<'_>> {
             if let Some(object) = evidence.as_object_mut() { object.remove("audit_id"); }
             json!({"kind": cause.kind, "confidence": cause.confidence, "summary": cause.summary, "evidence": evidence})
         }).collect();
-        let paths: Vec<_> = if event.paths.is_empty() {
-            event
-                .decoded
-                .as_ref()
-                .map(|c| c.paths.iter().map(|p| bytes(p.path.as_os_str())).collect())
-                .unwrap_or_default()
-        } else {
-            event
-                .paths
-                .iter()
-                .map(|p| bytes(p.target.as_os_str()))
-                .collect()
-        };
+        let paths: Vec<_> = event.decoded.as_ref().map(|call| call.paths.iter().enumerate().map(|(index, path)| {
+            match event.paths.get(index) {
+                Some(walk) if walk.limitation.is_none() => bytes(walk.target.as_os_str()),
+                _ => json!({"path": bytes(path.path.as_os_str()), "base": path.base.as_ref().ok().map(|p| bytes(p.as_os_str()))}),
+            }
+        }).collect()).unwrap_or_default();
         let key = json!({"syscall": event.number, "arch": event.arch, "errno": event.errno, "operation": event.decoded.as_ref().map(|c| &c.operation), "paths": paths, "causes": causes,
             "unsupported_arguments": if event.decoded.is_none() { Some(event.args) } else { None }}).to_string();
         let pid = event.context.as_ref().map_or(event.tid as u32, |c| c.tgid);
