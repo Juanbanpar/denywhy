@@ -18,6 +18,15 @@ fn main() {
     match trace::run(&args[1..]) {
         Ok(outcome) => {
             for event in outcome.failures {
+                if let Some(call) = &event.decoded {
+                    eprintln!("{} {:?}", call.name, call.operation);
+                    for path in &call.paths {
+                        eprintln!("dirfd={} path={:?}", path.dirfd, path.path);
+                    }
+                }
+                if let Some(limitation) = &event.limitation {
+                    eprintln!("{limitation}");
+                }
                 eprintln!(
                     "DENIED tid={} syscall={} arch={:#x} args={:?} errno={}",
                     event.tid, event.number, event.arch, event.args, event.errno

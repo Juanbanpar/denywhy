@@ -1,3 +1,6 @@
+pub mod memory;
+pub mod syscall;
+
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
 use std::io;
@@ -10,6 +13,8 @@ pub struct Failure {
     pub arch: u32,
     pub args: [u64; 6],
     pub errno: i32,
+    pub decoded: Option<syscall::DecodedCall>,
+    pub limitation: Option<String>,
 }
 
 pub struct Outcome {
@@ -155,24 +160,31 @@ fn trace(child: i32) -> io::Result<Outcome> {
             })?;
             match info.op {
                 1 if size >= 80 => {
-                    pending.insert(
-                        tid,
-                        (info.arch, info.data[0], info.data[1..7].try_into().unwrap()),
-                    );
+                    let args = info.data[1..7].try_into().unwrap();
+                    // Read pointers at entry: the application may alter or unmap
+                    // the pathname before the corresponding exit stop.
+                    let decoded = syscall::decode(tid, info.arch, info.data[0], args);
+                    pending.insert(tid, (info.arch, info.data[0], args, decoded));
                 }
                 2 if size >= 33 => {
-                    if let Some((arch, number, args)) = pending.remove(&tid) {
+                    if let Some((arch, number, args, decoded)) = pending.remove(&tid) {
                         let errno = -(info.data[0] as i64);
                         if info.data[1] & 0xff != 0
                             && [libc::EACCES as i64, libc::EPERM as i64, libc::EROFS as i64]
                                 .contains(&errno)
                         {
+                            let (decoded, limitation) = match decoded {
+                                Ok(call) => (call, None),
+                                Err(e) => (None, Some(e)),
+                            };
                             failures.push(Failure {
                                 tid,
                                 number,
                                 arch,
                                 args,
                                 errno: errno as i32,
+                                decoded,
+                                limitation,
                             });
                         }
                     }
