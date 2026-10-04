@@ -75,7 +75,11 @@ fn main() {
         }
         Err(error) => {
             eprintln!("denywhy: {error}");
-            std::process::exit(125);
+            std::process::exit(if error.kind() == std::io::ErrorKind::Unsupported {
+                124
+            } else {
+                125
+            });
         }
     }
 }
