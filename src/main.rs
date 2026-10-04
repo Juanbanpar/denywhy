@@ -1,7 +1,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::ffi::OsString;
-use std::os::unix::process::ExitStatusExt;
+mod trace;
 
 fn main() {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -15,17 +15,18 @@ fn main() {
         eprintln!("denywhy: expected -- command [args...]");
         std::process::exit(125);
     }
-    match std::process::Command::new(&args[1])
-        .args(&args[2..])
-        .status()
-    {
-        Ok(status) => std::process::exit(
-            status
-                .code()
-                .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
-        ),
+    match trace::run(&args[1..]) {
+        Ok(outcome) => {
+            for event in outcome.failures {
+                eprintln!(
+                    "DENIED tid={} syscall={} arch={:#x} args={:?} errno={}",
+                    event.tid, event.number, event.arch, event.args, event.errno
+                );
+            }
+            std::process::exit(outcome.code);
+        }
         Err(error) => {
-            eprintln!("denywhy: cannot run {:?}: {error}", args[1]);
+            eprintln!("denywhy: {error}");
             std::process::exit(125);
         }
     }

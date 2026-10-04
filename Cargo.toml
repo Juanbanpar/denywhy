@@ -6,3 +6,4 @@ license = "MIT OR Apache-2.0"
 description = "Explain permission-related Linux syscall failures"
 
 [dependencies]
+libc = "0.2"
