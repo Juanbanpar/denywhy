@@ -48,11 +48,14 @@ fn pieces(path: &Path) -> VecDeque<OsString> {
 }
 
 pub fn walk(root: &Path, base: &Path, path: &Path, follow_final: bool) -> Walk {
-    let mut queue = pieces(if path.is_absolute() { path } else { base });
-    if !path.is_absolute() {
-        queue.extend(pieces(path));
-    }
-    let mut current = PathBuf::from("/");
+    let mut queue = pieces(path);
+    // A relative dirfd/cwd walk starts at that directory. Its ancestors are not
+    // traversed by the syscall and must not become false DAC explanations.
+    let mut current = if path.is_absolute() {
+        PathBuf::from("/")
+    } else {
+        base.to_path_buf()
+    };
     let mut components = Vec::new();
     let mut links = 0;
     let mut missing = false;

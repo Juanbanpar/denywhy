@@ -5,8 +5,10 @@
 )))]
 compile_error!("denywhy supports native Linux x86_64 and aarch64 only");
 
+mod analyze;
 mod cli;
 mod fs;
+mod model;
 mod output;
 mod procfs;
 mod trace;
@@ -49,6 +51,9 @@ fn main() {
                             .unwrap_or("unsupported"),
                         output::errno(event.errno)
                     );
+                    for cause in &event.causes {
+                        eprintln!("Cause: {} ({:?})", cause.summary, cause.confidence);
+                    }
                     if let Some(call) = &event.decoded {
                         eprintln!("operation: {:?}", call.operation);
                         for path in &call.paths {

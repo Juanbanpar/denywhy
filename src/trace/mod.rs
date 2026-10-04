@@ -17,6 +17,7 @@ pub struct Failure {
     pub limitations: Vec<String>,
     pub context: Option<crate::procfs::status::ProcessContext>,
     pub paths: Vec<crate::fs::path::Walk>,
+    pub causes: Vec<crate::model::Cause>,
 }
 
 pub struct Outcome {
@@ -208,7 +209,7 @@ fn trace(child: i32) -> io::Result<Outcome> {
                                         .collect()
                                 })
                                 .unwrap_or_default();
-                            failures.push(Failure {
+                            let mut failure = Failure {
                                 tid,
                                 number,
                                 arch,
@@ -218,7 +219,10 @@ fn trace(child: i32) -> io::Result<Outcome> {
                                 limitations,
                                 context,
                                 paths,
-                            });
+                                causes: Vec::new(),
+                            };
+                            crate::analyze::analyze_denial(&mut failure);
+                            failures.push(failure);
                         }
                     }
                 }
