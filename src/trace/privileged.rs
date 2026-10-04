@@ -69,7 +69,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     #[test]
     fn refuses_setid_before_tracing() {
-        let path = std::env::temp_dir().join(format!("denywhy-setid-{}", std::process::id()));
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("program");
         fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o4755)).unwrap();
         let result = check(Path::new("/"), &path, 0);

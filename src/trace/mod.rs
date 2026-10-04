@@ -37,23 +37,35 @@ fn executable(command: &OsString) -> PathBuf {
     if command.as_bytes().contains(&b'/') {
         return PathBuf::from(command);
     }
-    if let Some(path) = std::env::var_os("PATH") {
-        for directory in std::env::split_paths(&path) {
-            let candidate = directory.join(command);
-            if candidate.is_file() {
-                return candidate;
-            }
+    let path = std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/bin:/usr/bin"));
+    let mut denied = None;
+    for directory in std::env::split_paths(&path) {
+        let candidate = directory.join(command);
+        let Ok(name) = CString::new(candidate.as_os_str().as_bytes()) else {
+            continue;
+        };
+        // This checks PATH candidates using the invoking user's access state;
+        // the chosen executable is separately inspected before the child runs.
+        if unsafe { libc::access(name.as_ptr(), libc::X_OK) } == 0 && candidate.is_file() {
+            return candidate;
+        }
+        if denied.is_none() && candidate.exists() {
+            denied = Some(candidate);
         }
     }
+    if let Some(candidate) = denied {
+        return candidate;
+    }
+
     PathBuf::from(command)
 }
 
 pub fn run(command: &[OsString], redirect_stdout: bool) -> io::Result<Outcome> {
     let program = executable(&command[0]);
-    privileged::check(&PathBuf::from("/"), &program, 0)
+    privileged::check(&PathBuf::from("/"), &std::path::absolute(&program)?, 0)
         .map_err(|e| io::Error::new(io::ErrorKind::Unsupported, e))?;
     let executable = CString::new(program.as_os_str().as_bytes())?;
-    signals::install()?;
+    let inherited_signals = signals::install()?;
     let arguments: Vec<CString> = command
         .iter()
         .map(|a| CString::new(a.as_bytes()))
@@ -69,8 +81,14 @@ pub fn run(command: &[OsString], redirect_stdout: bool) -> io::Result<Outcome> {
     if child == 0 {
         // These buffers remain live in the forked address space through execv.
         unsafe {
-            signals::reset_child();
-            if libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) == -1 {
+            signals::reset_child(&inherited_signals);
+            if libc::ptrace(
+                libc::PTRACE_TRACEME,
+                0,
+                std::ptr::null_mut::<libc::c_void>(),
+                std::ptr::null_mut::<libc::c_void>(),
+            ) == -1
+            {
                 libc::_exit(125);
             }
             if redirect_stdout && libc::dup2(libc::STDERR_FILENO, libc::STDOUT_FILENO) < 0 {
@@ -97,6 +115,7 @@ struct PendingSyscall {
 }
 #[derive(Default)]
 struct Tracee {
+    tgid: Option<i32>,
     pending: Option<PendingSyscall>,
     newborn: bool,
 }
@@ -109,7 +128,7 @@ impl Drop for Tracees {
             // Only children tracked by this tracer are killed. ESRCH means that
             // a thread already exited; cleanup must tolerate that race.
             unsafe {
-                libc::kill(*tid, libc::SIGKILL);
+                libc::syscall(libc::SYS_tkill, *tid, libc::SIGKILL);
             }
         }
         if self.threads.is_empty() {
@@ -137,6 +156,15 @@ fn trace(child: i32) -> io::Result<Outcome> {
         threads: HashMap::from([(child, Tracee::default())]),
     };
     let (_, status) = wait_for_tracees(&tracees)?;
+    if libc::WIFSIGNALED(status) {
+        tracees.threads.clear();
+        let signal = libc::WTERMSIG(status);
+        return Ok(Outcome {
+            code: 128 + signal,
+            signal: Some(signal),
+            failures: Vec::new(),
+        });
+    }
     if !libc::WIFSTOPPED(status) {
         tracees.threads.clear();
         return Err(io::Error::other(format!(
@@ -157,7 +185,17 @@ fn trace(child: i32) -> io::Result<Outcome> {
     )?;
     let mut failures = Vec::new();
     let mut main_exit = None;
-    ptrace(libc::PTRACE_SYSCALL, child, 0, 0)?;
+    let initial_signal = libc::WSTOPSIG(status);
+    ptrace(
+        libc::PTRACE_SYSCALL,
+        child,
+        0,
+        if initial_signal == libc::SIGSTOP {
+            0
+        } else {
+            initial_signal as usize
+        },
+    )?;
     while !tracees.threads.is_empty() {
         let (tid, status) = wait_for_tracees(&tracees)?;
         if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
@@ -180,8 +218,13 @@ fn trace(child: i32) -> io::Result<Outcome> {
         // event is consumed. Keep its state instead of resetting it later.
         tracees.threads.entry(tid).or_insert_with(|| Tracee {
             newborn: true,
-            pending: None,
+            ..Tracee::default()
         });
+        if tracees.threads.get(&tid).unwrap().tgid.is_none() {
+            tracees.threads.get_mut(&tid).unwrap().tgid = crate::procfs::status::capture(tid)
+                .ok()
+                .map(|c| c.tgid as i32);
+        }
         let mut delivery = 0;
         if signal == (libc::SIGTRAP | 0x80) {
             syscall_stop(tid, tracees.threads.get_mut(&tid).unwrap(), &mut failures)?;
@@ -191,7 +234,7 @@ fn trace(child: i32) -> io::Result<Outcome> {
                     let new_tid = event_message(tid)? as i32;
                     tracees.threads.entry(new_tid).or_insert_with(|| Tracee {
                         newborn: true,
-                        pending: None,
+                        ..Tracee::default()
                     });
                 }
                 libc::PTRACE_EVENT_EXEC => {
@@ -203,6 +246,23 @@ fn trace(child: i32) -> io::Result<Outcome> {
                     {
                         tracees.threads.insert(tid, old);
                     }
+                    tracees
+                        .threads
+                        .retain(|thread, state| *thread == tid || state.tgid != Some(tid));
+                    tracees.threads.get_mut(&tid).unwrap().tgid = Some(tid);
+                    // This also covers implicit shebang interpreters and entries
+                    // whose path could not be inspected before execution.
+                    let executable = PathBuf::from(format!("/proc/{tid}/exe"));
+                    std::fs::metadata(&executable).map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            format!(
+                                "cannot verify executable privilege semantics for TID {tid}: {e}"
+                            ),
+                        )
+                    })?;
+                    privileged::check(&PathBuf::from("/"), &executable, 0)
+                        .map_err(|e| io::Error::new(io::ErrorKind::Unsupported, e))?;
                 }
                 libc::PTRACE_EVENT_EXIT => {}
                 _ => {
@@ -263,7 +323,12 @@ fn syscall_stop(tid: i32, tracee: &mut Tracee, failures: &mut Vec<Failure>) -> i
         } else {
             e
         }
-    })?;
+    });
+    let size = match size {
+        Ok(size) => size,
+        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Ok(()),
+        Err(e) => return Err(e),
+    };
     match info.op {
         1 if size >= 80 => {
             let args = info.data[1..7].try_into().unwrap();
@@ -319,6 +384,7 @@ fn syscall_stop(tid: i32, tracee: &mut Tracee, failures: &mut Vec<Failure>) -> i
     Ok(())
 }
 fn capture_failure(tid: i32, pending: PendingSyscall, errno: i32) -> Failure {
+    let timestamp = SystemTime::now();
     let (decoded, limitation) = match pending.decoded {
         Ok(call) => (call, None),
         Err(e) => (None, Some(e)),
@@ -367,6 +433,6 @@ fn capture_failure(tid: i32, pending: PendingSyscall, errno: i32) -> Failure {
         paths,
         causes: Vec::new(),
         mounts: Vec::new(),
-        timestamp: SystemTime::now(),
+        timestamp,
     }
 }

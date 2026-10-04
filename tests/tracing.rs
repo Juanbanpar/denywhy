@@ -163,6 +163,11 @@ fn captures_filesystem_syscalls_and_relative_paths() {
             "{report}"
         );
     }
+    fs::set_permissions(
+        dir.path().join("blocked"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
 }
 #[test]
 fn seccomp_errno_does_not_become_dac() {
@@ -192,6 +197,11 @@ fn seccomp_errno_does_not_become_dac() {
             "{report}"
         );
     }
+    fs::set_permissions(
+        dir.path().join("blocked"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
 }
 #[test]
 fn follows_fork_and_threads_without_losing_denials() {
@@ -199,12 +209,17 @@ fn follows_fork_and_threads_without_losing_denials() {
         return;
     }
     let dir = fixture();
-    for _ in 0..5 {
-        let report = run("race", dir.path());
+    for mode in ["race", "race", "race", "race", "race", "exec_thread"] {
+        let report = run(mode, dir.path());
         let denials = report["denials"].as_array().unwrap();
         assert!(!denials.is_empty());
         assert!(denials.iter().all(|d| d["tid"].as_u64().unwrap() > 0));
     }
+    fs::set_permissions(
+        dir.path().join("blocked"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
 }
 #[test]
 fn preserves_signal_termination() {
@@ -218,6 +233,64 @@ fn preserves_signal_termination() {
         "kill -TERM $$",
     ]));
     assert_eq!(result.status.code(), Some(143));
+}
+
+#[test]
+fn forwards_interrupt_and_termination_without_stranding_tracees() {
+    if !available() {
+        return;
+    }
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        let dir = fixture();
+        let marker = dir.path().join("ready");
+        let mut wrapper = Command::new(env!("CARGO_BIN_EXE_denywhy"))
+            .args([
+                "--",
+                std::env::current_exe().unwrap().to_str().unwrap(),
+                "--ignored",
+                "--exact",
+                "tracee_helper",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("DENYWHY_FIXTURE_MODE", "pause")
+            .env("DENYWHY_FIXTURE_DIR", dir.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() {
+            if Instant::now() > deadline {
+                let _ = wrapper.kill();
+                let _ = wrapper.wait();
+                panic!("tracee did not become ready");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let tracee: i32 = fs::read_to_string(marker).unwrap().parse().unwrap();
+        // The PID belongs to the spawned diagnostic wrapper, not another process.
+        assert_eq!(unsafe { libc::kill(wrapper.id() as i32, signal) }, 0);
+        let status = loop {
+            if let Some(status) = wrapper.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() > deadline {
+                let _ = wrapper.kill();
+                let _ = wrapper.wait();
+                panic!("signal left wrapper waiting");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(status.code(), Some(128 + signal));
+        // Once the wrapper reaped its command, this PID must not be left stopped.
+        assert_eq!(unsafe { libc::kill(tracee, 0) }, -1);
+        fs::set_permissions(
+            dir.path().join("blocked"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+    }
 }
 
 #[test]
@@ -242,6 +315,52 @@ fn tracee_helper() {
     let new = CString::new(dir.join("blocked/new").as_os_str().as_bytes()).unwrap();
     let absolute_dir = CString::new(dir.as_os_str().as_bytes()).unwrap();
     let relative = c"blocked/file";
+    if mode == "pause" {
+        fs::write(dir.join("ready"), std::process::id().to_string()).unwrap();
+        loop {
+            // pause waits for the externally forwarded signal.
+            unsafe {
+                libc::pause();
+            }
+        }
+    }
+    if mode == "exec_thread" {
+        let binary = CString::new(std::env::current_exe().unwrap().as_os_str().as_bytes()).unwrap();
+        let arguments: Vec<CString> = [
+            binary.clone(),
+            CString::new("--ignored").unwrap(),
+            CString::new("--exact").unwrap(),
+            CString::new("tracee_helper").unwrap(),
+            CString::new("--nocapture").unwrap(),
+            CString::new("--test-threads=1").unwrap(),
+        ]
+        .into();
+        let environment = [
+            CString::new("DENYWHY_FIXTURE_MODE=race").unwrap(),
+            CString::new(
+                [
+                    b"DENYWHY_FIXTURE_DIR=".as_slice(),
+                    dir.as_os_str().as_bytes(),
+                ]
+                .concat(),
+            )
+            .unwrap(),
+        ];
+        std::thread::spawn(move || {
+            let mut argv: Vec<_> = arguments.iter().map(|a| a.as_ptr()).collect();
+            argv.push(std::ptr::null());
+            let mut envp: Vec<_> = environment.iter().map(|a| a.as_ptr()).collect();
+            envp.push(std::ptr::null());
+            // All argument and environment buffers remain live through execve.
+            unsafe {
+                libc::execve(binary.as_ptr(), argv.as_ptr(), envp.as_ptr());
+            }
+            panic!("helper execve failed");
+        })
+        .join()
+        .unwrap();
+        panic!("helper execve unexpectedly returned");
+    }
     // Pointers refer to live CString storage. Every syscall below is a deliberate
     // fixture operation; its return value is checked before the helper exits.
     unsafe {

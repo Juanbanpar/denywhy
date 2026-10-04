@@ -16,7 +16,14 @@ pub struct SyscallInfo {
 pub fn ptrace(request: u32, tid: i32, addr: usize, data: usize) -> io::Result<i64> {
     // The request determines whether addr/data are integers or pointers. Callers
     // provide live, suitably sized buffers for requests that write through data.
-    let result = unsafe { libc::ptrace(request, tid, addr, data) };
+    let result = unsafe {
+        libc::ptrace(
+            request,
+            tid,
+            addr as *mut libc::c_void,
+            data as *mut libc::c_void,
+        )
+    };
     if result == -1 {
         Err(io::Error::last_os_error())
     } else {

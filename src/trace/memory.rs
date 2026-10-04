@@ -21,9 +21,11 @@ pub fn read_bytes(tid: i32, address: u64, max: usize) -> io::Result<Vec<u8>> {
 }
 
 pub fn read_c_string(tid: i32, address: u64, max: usize) -> io::Result<Vec<u8>> {
+    let max = max.min(libc::PATH_MAX as usize + 256);
     let mut bytes = Vec::new();
     // Reading across an inaccessible following page can fail even when the NUL
     // is on the current page. Bound each transfer to a single page.
+    // sysconf reads a process-wide scalar and takes no user buffer.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     let page = if page > 0 { page as usize } else { 4096 };
     while bytes.len() < max {
