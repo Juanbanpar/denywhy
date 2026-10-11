@@ -60,7 +60,9 @@ pub fn parse(bytes: &[u8]) -> Result<Acl, String> {
         return Err("invalid Linux POSIX ACL xattr header or length".into());
     }
     let entries: Vec<Entry> = bytes[4..]
-        .chunks_exact(8)
+        .as_chunks::<8>()
+        .0
+        .iter()
         .map(|e| Entry {
             tag: u16::from_le_bytes(e[..2].try_into().unwrap()),
             permissions: u16::from_le_bytes(e[2..4].try_into().unwrap()),
